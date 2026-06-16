@@ -31,7 +31,7 @@ namespace {
 class RawLightSensorCallback : public IEventQueueCallback {
   public:
     Return<void> onEvent(const Event& e) {
-        _oem_msg msg;
+        _oem_msg msg = {};
         msg.notifyType = REPORT_VALUE;
         msg.value = e.u.vec4.y;
         msg.notifyTypeFloat = msg.notifyType;
@@ -58,19 +58,29 @@ RawLightNotifier::~RawLightNotifier() {
 }
 
 void RawLightNotifier::notify() {
+    if (mQueue == nullptr) {
+        LOG(ERROR) << "mQueue is null";
+        mActive = false;
+        return;
+    }
+
     Result res;
 
     android::base::unique_fd disp_fd_ =
             android::base::unique_fd(open(kDispFeatureDevice.c_str(), O_RDWR));
     if (disp_fd_.get() == -1) {
         LOG(ERROR) << "failed to open " << kDispFeatureDevice;
+        mActive = false;
+        return;
     }
 
     // Enable the sensor initially
     res = mQueue->enableSensor(mSensorHandle, 20000 /* sample period */, 0 /* latency */);
     if (res != Result::OK) {
         LOG(ERROR) << "failed to enable sensor";
-    } else isEnable = true;
+    } else {
+        isEnable = true;
+    }
 
     // Register for power events
     const std::vector<disp_event_type> notifyEvents = {MI_DISP_EVENT_POWER, MI_DISP_EVENT_FPS,
@@ -90,21 +100,16 @@ void RawLightNotifier::notify() {
             .events = POLLIN,
     };
 
-    _oem_msg* msg = new _oem_msg;
+    _oem_msg msg = {};
     notify_t notifyType;
     float value;
 
     while (mActive) {
-        int rc = poll(&dispEventPoll, 1, -1);
-        if (rc < 0) {
-            LOG(ERROR) << "failed to poll " << kDispFeatureDevice << ", err: " << rc;
-            continue;
-        }
+        int rc = poll(&dispEventPoll, 1, 1000); // 1000ms
+        if (rc <= 0) continue;
 
         std::shared_ptr<disp_event_resp> response = parseDispEvent(disp_fd_.get());
-        if (response == nullptr) {
-            continue;
-        }
+        if (response == nullptr) continue;
 
         if (response->base.type == MI_DISP_EVENT_POWER) {
             notifyType = POWER_STATE;
@@ -114,17 +119,15 @@ void RawLightNotifier::notify() {
                     if (!isEnable) {
                         res = mQueue->enableSensor(mSensorHandle, 20000 /* sample period */,
                                                    0 /* latency */);
-                        if (res != Result::OK) {
-                            LOG(ERROR) << "failed to enable sensor";
-                        } else isEnable = true;
+                        if (res != Result::OK) LOG(ERROR) << "failed to enable sensor";
+                        else isEnable = true;
                     }
                     break;
                 default:
                     if (isEnable) {
                         res = mQueue->disableSensor(mSensorHandle);
-                        if (res != Result::OK) {
-                            LOG(ERROR) << "failed to disable sensor";
-                        } else isEnable = false;
+                        if (res != Result::OK) LOG(ERROR) << "failed to disable sensor";
+                        else isEnable = false;
                     }
                     break;
             }
@@ -147,17 +150,16 @@ void RawLightNotifier::notify() {
                     value = response->data[0];
                     break;
                 default:
-                    LOG(ERROR) << "got unknown event: " << response->base.type;
                     continue;
             }
         }
-        msg->sensorType = kSensorTypeAmbientlightRaw;
-        msg->notifyType = notifyType;
-        msg->notifyTypeFloat = notifyType;
-        msg->value = value;
-        msg->unknown1 = 1;
-        msg->unknown2 = 5;
+        msg.sensorType = kSensorTypeAmbientlightRaw;
+        msg.notifyType = notifyType;
+        msg.notifyTypeFloat = notifyType;
+        msg.value = value;
+        msg.unknown1 = 1;
+        msg.unknown2 = 5;
 
-        SscCalApiWrapper::getInstance().processMsg(msg);
+        SscCalApiWrapper::getInstance().processMsg(&msg);
     }
 }
