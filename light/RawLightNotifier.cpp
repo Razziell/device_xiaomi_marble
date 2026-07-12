@@ -10,14 +10,18 @@
 
 #include <android-base/logging.h>
 #include <android-base/unique_fd.h>
+#include <cerrno>
+#include <cstring>
 #include <display/drm/mi_disp.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <vector>
 
 #include "SensorNotifierUtils.h"
 #include "SscCalApi.h"
 
-static const std::string kDispFeatureDevice = "/dev/mi_display/disp_feature";
+static const std::string kDispFeatureDevice =
+        "/dev/mi_display/disp_feature";
 
 // sensor: xiaomi.sensor.ambientlight.raw
 static const uint32_t kSensorTypeAmbientlightRaw = 33171111;
@@ -47,10 +51,12 @@ class RawLightSensorCallback : public IEventQueueCallback {
 
 }  // namespace
 
-RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager) : SensorNotifier(manager),
-                     isEnable(false) {
-    initializeSensorQueue("xiaomi.sensor.ambientlight.factory", false,
-                          new RawLightSensorCallback());
+RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
+    : SensorNotifier(manager), isEnable(false) {
+    initializeSensorQueue(
+            "xiaomi.sensor.ambientlight.factory",
+            false,
+            new RawLightSensorCallback());
 }
 
 RawLightNotifier::~RawLightNotifier() {
@@ -60,74 +66,147 @@ RawLightNotifier::~RawLightNotifier() {
 void RawLightNotifier::notify() {
     if (mQueue == nullptr) {
         LOG(ERROR) << "mQueue is null";
-        mActive = false;
         return;
     }
-
-    Result res;
 
     android::base::unique_fd disp_fd_ =
-            android::base::unique_fd(open(kDispFeatureDevice.c_str(), O_RDWR));
+            android::base::unique_fd(
+                    open(kDispFeatureDevice.c_str(), O_RDWR));
     if (disp_fd_.get() == -1) {
-        LOG(ERROR) << "failed to open " << kDispFeatureDevice;
-        mActive = false;
+        PLOG(ERROR) << "failed to open "
+                    << kDispFeatureDevice;
         return;
     }
 
-    // Enable the sensor initially
-    res = mQueue->enableSensor(mSensorHandle, 20000 /* sample period */, 0 /* latency */);
-    if (res != Result::OK) {
-        LOG(ERROR) << "failed to enable sensor";
+    // Enable the sensor initially while the display is expected to be on.
+    auto result = mQueue->enableSensor(
+            mSensorHandle,
+            20000 /* sample period */,
+            0 /* latency */);
+    if (!result.isOk()) {
+        LOG(ERROR) << "enableSensor transaction failed: "
+                   << result.description();
+    } else if (result != Result::OK) {
+        LOG(ERROR) << "failed to enable raw light sensor";
     } else {
         isEnable = true;
     }
 
-    // Register for power events
-    const std::vector<disp_event_type> notifyEvents = {MI_DISP_EVENT_POWER, MI_DISP_EVENT_FPS,
-                                                       MI_DISP_EVENT_51_BRIGHTNESS,
-                                                       MI_DISP_EVENT_HBM, MI_DISP_EVENT_DC};
+    const std::vector<disp_event_type> notifyEvents = {
+            MI_DISP_EVENT_POWER,
+            MI_DISP_EVENT_FPS,
+            MI_DISP_EVENT_51_BRIGHTNESS,
+            MI_DISP_EVENT_HBM,
+            MI_DISP_EVENT_DC,
+    };
 
+    // Register for primary display events.
     for (const disp_event_type& event : notifyEvents) {
-        disp_event_req req;
+        disp_event_req req = {};
         req.base.flag = 0;
         req.base.disp_id = MI_DISP_PRIMARY;
         req.type = event;
-        ioctl(disp_fd_.get(), MI_DISP_IOCTL_REGISTER_EVENT, &req);
+
+        if (ioctl(disp_fd_.get(),
+                  MI_DISP_IOCTL_REGISTER_EVENT,
+                  &req) < 0) {
+            PLOG(ERROR) << "failed to register display event "
+                        << static_cast<int>(event);
+        }
     }
 
-    struct pollfd dispEventPoll = {
-            .fd = disp_fd_.get(),
-            .events = POLLIN,
+    struct pollfd pollfds[] = {
+            {
+                    .fd = disp_fd_.get(),
+                    .events = POLLIN,
+                    .revents = 0,
+            },
+            {
+                    .fd = stopEventFd(),
+                    .events = POLLIN,
+                    .revents = 0,
+            },
     };
 
     _oem_msg msg = {};
     notify_t notifyType;
     float value;
 
-    while (mActive) {
-        int rc = poll(&dispEventPoll, 1, 1000); // 1000ms
-        if (rc <= 0) continue;
+    while (isActive()) {
+        int rc = poll(pollfds, 2, -1);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
 
-        std::shared_ptr<disp_event_resp> response = parseDispEvent(disp_fd_.get());
-        if (response == nullptr) continue;
+            PLOG(ERROR) << "failed to poll "
+                        << kDispFeatureDevice;
+            break;
+        }
+
+        if (pollfds[1].revents & POLLIN) {
+            consumeStopEvent();
+            break;
+        }
+
+        if (pollfds[1].revents &
+                (POLLERR | POLLHUP | POLLNVAL)) {
+            LOG(ERROR) << "stop eventfd failed, revents="
+                       << pollfds[1].revents;
+            break;
+        }
+
+        if (pollfds[0].revents &
+                (POLLERR | POLLHUP | POLLNVAL)) {
+            LOG(ERROR) << "display event fd failed, revents="
+                       << pollfds[0].revents;
+            break;
+        }
+
+        if (!(pollfds[0].revents & POLLIN)) {
+            continue;
+        }
+
+        std::shared_ptr<disp_event_resp> response =
+                parseDispEvent(disp_fd_.get());
+        if (response == nullptr) {
+            continue;
+        }
 
         if (response->base.type == MI_DISP_EVENT_POWER) {
             notifyType = POWER_STATE;
             value = response->data[0];
+
             switch (response->data[0]) {
                 case MI_DISP_POWER_ON:
                     if (!isEnable) {
-                        res = mQueue->enableSensor(mSensorHandle, 20000 /* sample period */,
-                                                   0 /* latency */);
-                        if (res != Result::OK) LOG(ERROR) << "failed to enable sensor";
-                        else isEnable = true;
+                        auto enableResult = mQueue->enableSensor(
+                                mSensorHandle,
+                                20000 /* sample period */,
+                                0 /* latency */);
+                        if (!enableResult.isOk()) {
+                            LOG(ERROR) << "enableSensor transaction failed: "
+                                       << enableResult.description();
+                        } else if (enableResult != Result::OK) {
+                            LOG(ERROR) << "failed to enable raw light sensor";
+                        } else {
+                            isEnable = true;
+                        }
                     }
                     break;
+
                 default:
                     if (isEnable) {
-                        res = mQueue->disableSensor(mSensorHandle);
-                        if (res != Result::OK) LOG(ERROR) << "failed to disable sensor";
-                        else isEnable = false;
+                        auto disableResult =
+                                mQueue->disableSensor(mSensorHandle);
+                        if (!disableResult.isOk()) {
+                            LOG(ERROR) << "disableSensor transaction failed: "
+                                       << disableResult.description();
+                        } else if (disableResult != Result::OK) {
+                            LOG(ERROR) << "failed to disable raw light sensor";
+                        } else {
+                            isEnable = false;
+                        }
                     }
                     break;
             }
@@ -137,22 +216,32 @@ void RawLightNotifier::notify() {
                     notifyType = DISPLAY_FREQUENCY;
                     value = response->data[0];
                     break;
-                case MI_DISP_EVENT_51_BRIGHTNESS:
+
+                case MI_DISP_EVENT_51_BRIGHTNESS: {
+                    uint16_t brightness;
+                    memcpy(&brightness,
+                           response->data,
+                           sizeof(brightness));
                     notifyType = BRIGHTNESS;
-                    value = *(uint16_t*)response->data;
+                    value = brightness;
                     break;
+                }
+
                 case MI_DISP_EVENT_HBM:
                     notifyType = BRIGHTNESS;
                     value = response->data[0] ? -1 : -2;
                     break;
+
                 case MI_DISP_EVENT_DC:
                     notifyType = DC_STATE;
                     value = response->data[0];
                     break;
+
                 default:
                     continue;
             }
         }
+
         msg.sensorType = kSensorTypeAmbientlightRaw;
         msg.notifyType = notifyType;
         msg.notifyTypeFloat = notifyType;
@@ -161,5 +250,15 @@ void RawLightNotifier::notify() {
         msg.unknown2 = 5;
 
         SscCalApiWrapper::getInstance().processMsg(&msg);
+    }
+
+    if (isEnable) {
+        auto disableResult = mQueue->disableSensor(mSensorHandle);
+        if (!disableResult.isOk()) {
+            LOG(ERROR) << "disableSensor transaction failed during shutdown: "
+                       << disableResult.description();
+        }
+
+        isEnable = false;
     }
 }
