@@ -10,6 +10,9 @@ $(call inherit-product, device/xiaomi/marble/device.mk)
 # Use Pico GApps package
 TARGET_USES_PICO_GAPPS := true
 
+# Use LineageOS Launcher3 instead of Pixel Launcher
+TARGET_USE_AOSP_LAUNCHER := true
+
 # Inherit from common lineage configuration
 $(call inherit-product, vendor/lineage/config/common_full_phone.mk)
 
