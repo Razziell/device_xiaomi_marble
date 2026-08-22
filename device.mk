@@ -34,6 +34,16 @@ PRODUCT_PACKAGES += \
 # Light
 $(call soong_config_set,xiaomi_sm8450_sensor_notifier,extension_lib,//device/xiaomi/marble:libsensor-notifier-ext-light)
 
+# Content-aware correction for the under-display ambient light sensor
+PRODUCT_PACKAGES += \
+    marble-als-correction
+
+PRODUCT_SYSTEM_SERVER_JARS_EXTRA += \
+    system_ext:marble-als-correction
+
+PRODUCT_VENDOR_PROPERTIES += \
+    ro.vendor.display.als_correction_class=com.android.server.display.MarbleAlsCorrection
+
 # Logging
 SPAMMY_LOG_TAGS := \
     MiStcImpl \

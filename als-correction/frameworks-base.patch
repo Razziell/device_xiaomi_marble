@@ -1,0 +1,57 @@
+diff --git a/services/core/java/com/android/server/display/AutomaticBrightnessController.java b/services/core/java/com/android/server/display/AutomaticBrightnessController.java
+index b8b4758277b2..d8897522f81e 100644
+--- a/services/core/java/com/android/server/display/AutomaticBrightnessController.java
++++ b/services/core/java/com/android/server/display/AutomaticBrightnessController.java
+@@ -43,6 +43,7 @@ import android.os.Message;
+ import android.os.PowerManager;
+ import android.os.RemoteException;
+ import android.os.SystemClock;
++import android.os.SystemProperties;
+ import android.os.Trace;
+ import android.util.EventLog;
+ import android.util.IndentingPrintWriter;
+@@ -65,6 +66,7 @@ import java.io.PrintWriter;
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
+ import java.util.concurrent.TimeUnit;
++import java.util.function.DoubleUnaryOperator;
+ 
+ /**
+  * Manages the associated display brightness when in auto-brightness mode. This is also
+@@ -1436,13 +1438,35 @@ public class AutomaticBrightnessController {
+         }
+     }
+ 
++    /** Optional device-specific correction loaded from SYSTEMSERVERCLASSPATH. */
++    private final DoubleUnaryOperator mAlsCorrection = loadAlsCorrection();
++
++    private static DoubleUnaryOperator loadAlsCorrection() {
++        final String className = SystemProperties.get(
++                "ro.vendor.display.als_correction_class");
++        if (className.isEmpty()) {
++            return value -> value;
++        }
++
++        try {
++            final Class<?> clazz = Class.forName(className);
++            final DoubleUnaryOperator correction = (DoubleUnaryOperator)
++                    clazz.getDeclaredConstructor().newInstance();
++            Slog.i(TAG, "Loaded ALS correction: " + className);
++            return correction;
++        } catch (ReflectiveOperationException | ClassCastException | LinkageError e) {
++            Slog.e(TAG, "Unable to load ALS correction: " + className, e);
++            return value -> value;
++        }
++    }
++
+     private final SensorEventListener mLightSensorListener = new SensorEventListener() {
+         @Override
+         public void onSensorChanged(SensorEvent event) {
+             if (mLightSensorEnabled) {
+                 // The time received from the sensor is in nano seconds, hence changing it to ms
+                 final long time = TimeUnit.NANOSECONDS.toMillis(event.timestamp);
+-                final float lux = event.values[0];
++                final float lux = (float) mAlsCorrection.applyAsDouble(event.values[0]);
+                 handleLightSensorEvent(time, lux);
+             }
+         }

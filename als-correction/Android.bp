@@ -1,0 +1,13 @@
+//
+// Copyright (C) 2026 The LineageOS Project
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+java_library {
+    name: "marble-als-correction",
+    srcs: ["src/**/*.java"],
+    installable: true,
+    system_ext_specific: true,
+    libs: ["services"],
+}

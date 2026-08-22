@@ -92,12 +92,12 @@ void RawLightNotifier::notify() {
         isEnable = true;
     }
 
+    // Boled accepts only BRIGHTNESS and REPORT_VALUE. POWER remains registered
+    // solely to manage the raw sensor lifecycle; FPS and DC are not needed.
     const std::vector<disp_event_type> notifyEvents = {
             MI_DISP_EVENT_POWER,
-            MI_DISP_EVENT_FPS,
             MI_DISP_EVENT_51_BRIGHTNESS,
             MI_DISP_EVENT_HBM,
-            MI_DISP_EVENT_DC,
     };
 
     // Register for primary display events.
@@ -174,9 +174,6 @@ void RawLightNotifier::notify() {
         }
 
         if (response->base.type == MI_DISP_EVENT_POWER) {
-            notifyType = POWER_STATE;
-            value = response->data[0];
-
             switch (response->data[0]) {
                 case MI_DISP_POWER_ON:
                     if (!isEnable) {
@@ -210,13 +207,12 @@ void RawLightNotifier::notify() {
                     }
                     break;
             }
+
+            // POWER is not supported by Lux_Ams_Tcs3701_Boled. It is consumed
+            // locally above and must not be forwarded to libssccalapi.
+            continue;
         } else {
             switch (response->base.type) {
-                case MI_DISP_EVENT_FPS:
-                    notifyType = DISPLAY_FREQUENCY;
-                    value = response->data[0];
-                    break;
-
                 case MI_DISP_EVENT_51_BRIGHTNESS: {
                     uint16_t brightness;
                     memcpy(&brightness,
@@ -230,11 +226,6 @@ void RawLightNotifier::notify() {
                 case MI_DISP_EVENT_HBM:
                     notifyType = BRIGHTNESS;
                     value = response->data[0] ? -1 : -2;
-                    break;
-
-                case MI_DISP_EVENT_DC:
-                    notifyType = DC_STATE;
-                    value = response->data[0];
                     break;
 
                 default:
