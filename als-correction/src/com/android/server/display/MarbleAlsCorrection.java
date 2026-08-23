@@ -86,6 +86,17 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
 
     private static final float DEF_GAMMA = 2.2f;
 
+    /**
+     * Spectral response of the complete marble OLED -> under-display TCS3701 -> TYPE_LIGHT
+     * path. Derived from automated black/red/green/blue/white measurements at five DBV levels
+     * (632, 1276, 2243, 3209 and 4095). At maximum DBV the measured residual contributions were
+     * R=136.13, G=544.17 and B=71.95 lux. The normalized weights intentionally sum to 1, preserving
+     * the existing white/gray calibration while correcting saturated-color content.
+     */
+    private static final double RED_WEIGHT = 0.1810;
+    private static final double GREEN_WEIGHT = 0.7234;
+    private static final double BLUE_WEIGHT = 0.0956;
+
     /** Natural panel size of the marble display, for cx/cy/r validation. */
     private static final int PANEL_WIDTH = 1080;
     private static final int PANEL_HEIGHT = 2400;
@@ -323,7 +334,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
         }
     }
 
-    /** Average light emission of the bitmap, linearized through the display gamma. */
+    /** Average TCS3701-weighted panel emission, linearized per RGB channel. */
     private static float averageLuma(Bitmap bitmap) {
         final int w = bitmap.getWidth();
         final int h = bitmap.getHeight();
@@ -339,12 +350,16 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
 
         double sum = 0;
         for (int px : pixels) {
-            final int r = (px >> 16) & 0xFF;
-            final int g = (px >> 8) & 0xFF;
-            final int b = px & 0xFF;
-            // Rec.709 luma; the panel emits roughly proportional to the linearized value.
-            final double srgb = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-            sum += Math.pow(srgb, gamma);
+            final double r = ((px >> 16) & 0xFF) / 255.0;
+            final double g = ((px >> 8) & 0xFF) / 255.0;
+            final double b = (px & 0xFF) / 255.0;
+
+            // Linearize each OLED primary independently, then apply the measured spectral response
+            // of the under-display ALS. Rec.709 weights describe human vision and under-corrected
+            // blue while over-correcting red on the measured marble panel.
+            sum += RED_WEIGHT * Math.pow(r, gamma)
+                    + GREEN_WEIGHT * Math.pow(g, gamma)
+                    + BLUE_WEIGHT * Math.pow(b, gamma);
         }
         return (float) (sum / pixels.length);
     }

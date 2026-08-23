@@ -5,9 +5,10 @@ SSC calibration compensates panel leakage using global backlight brightness (DBV
 it does not know which pixels are lit above the sensor. Consequently, light content in
 the sensor area can increase reported lux and automatic brightness.
 
-`MarbleAlsCorrection` samples a small framebuffer region above the sensor, calculates
-its linearized luma and subtracts the estimated residual panel leakage before the value
-is consumed by `AutomaticBrightnessController`.
+`MarbleAlsCorrection` samples a small framebuffer region above the sensor, converts each
+RGB primary to approximate linear panel emission, applies the measured TCS3701 spectral
+response and subtracts the estimated residual panel leakage before the value is consumed
+by `AutomaticBrightnessController`.
 
 ## Integration
 
@@ -64,9 +65,9 @@ on the next ALS event or framebuffer sample.
 | Property | Default | Clamped to | Meaning |
 |---|---:|---:|---|
 | `persist.sys.als_correction.enabled` | `true` | — | Enables or bypasses correction. |
-| `persist.sys.als_correction.k` | `650` | `0..1500` | Leakage in lux for luma `1.0` at maximum DBV. Larger values apply stronger correction. |
-| `persist.sys.als_correction.ref_luma` | `0.14` | `0..1` | Content luma below which no leakage is subtracted. |
-| `persist.sys.als_correction.gamma` | `2.2` | `1..4` | Gamma used to convert captured sRGB luma to approximate panel emission. |
+| `persist.sys.als_correction.k` | `650` | `0..1500` | Leakage in lux for a fully lit weighted RGB sample at maximum DBV. Larger values apply stronger correction. |
+| `persist.sys.als_correction.ref_luma` | `0.14` | `0..1` | Weighted content level below which no leakage is subtracted. |
+| `persist.sys.als_correction.gamma` | `2.2` | `1..4` | Gamma used to convert each captured RGB primary to approximate panel emission. |
 | `persist.sys.als_correction.cx` | `745` | `0..1079` | Sensor-area center X in natural panel coordinates. |
 | `persist.sys.als_correction.cy` | `51` | `0..2399` | Sensor-area center Y in natural panel coordinates. |
 | `persist.sys.als_correction.r` | `47` | `16..96` | Capture radius in natural panel pixels. |
@@ -151,11 +152,26 @@ unprivileged applications and shell users cannot normally change `persist.sys.*`
 * Change one parameter at a time under stable external lighting and compare white/dark content
   at the same fixed DBV.
 
+The spectral weights were derived from automated black/red/green/blue/white measurements
+at DBV 632, 1276, 2243, 3209 and 4095. At maximum DBV, the measured residual `TYPE_LIGHT`
+contributions were 136.13 lux red, 544.17 lux green and 71.95 lux blue. Their normalized
+weights are:
+
+```text
+R = 0.1810, G = 0.7234, B = 0.0956
+```
+
+They sum to 1, so the existing white/gray calibration and the user-facing `k` control are
+preserved. Compared with Rec.709 human-vision weights, this reduces red over-correction and
+increases blue correction without changing the number or frequency of screen captures.
+
 The correction formula is approximately:
 
 ```text
+linearR/G/B = pow(capturedR/G/B / 255, gamma)
+contentLevel = 0.1810 * linearR + 0.7234 * linearG + 0.0956 * linearB
 correctedLux = max(0, rawLux
-    - k * max(0, contentLuma - refLuma) * currentDbv / maximumDbv)
+    - k * max(0, contentLevel - refLuma) * currentDbv / maximumDbv)
 ```
 
 ## Capture safety
