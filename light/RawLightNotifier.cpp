@@ -26,6 +26,14 @@ static const std::string kDispFeatureDevice =
 // sensor: xiaomi.sensor.ambientlight.raw
 static const uint32_t kSensorTypeAmbientlightRaw = 33171111;
 
+// Request the factory ALS at 20 Hz. Reverse engineering of
+// libssccalapi@2.0.so showed that its TCS3701 calibration path requests sensor
+// data with a 50,000 us period. An automated test on marble also measured an
+// effective factory-event interval of about 100 ms even with the old 20,000 us
+// request, so 20 Hz retains sufficient input headroom without requesting an
+// unnecessary nominal 50 Hz stream.
+static constexpr int32_t kRawAlsSamplePeriodUs = 50000;
+
 using android::hardware::Return;
 using android::hardware::Void;
 using android::hardware::sensors::V1_0::Event;
@@ -81,7 +89,7 @@ void RawLightNotifier::notify() {
     // Enable the sensor initially while the display is expected to be on.
     auto result = mQueue->enableSensor(
             mSensorHandle,
-            20000 /* sample period */,
+            kRawAlsSamplePeriodUs,
             0 /* latency */);
     if (!result.isOk()) {
         LOG(ERROR) << "enableSensor transaction failed: "
@@ -179,7 +187,7 @@ void RawLightNotifier::notify() {
                     if (!isEnable) {
                         auto enableResult = mQueue->enableSensor(
                                 mSensorHandle,
-                                20000 /* sample period */,
+                                kRawAlsSamplePeriodUs,
                                 0 /* latency */);
                         if (!enableResult.isOk()) {
                             LOG(ERROR) << "enableSensor transaction failed: "
