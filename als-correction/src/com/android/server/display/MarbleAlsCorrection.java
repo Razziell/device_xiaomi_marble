@@ -44,14 +44,22 @@ package com.android.server.display;
 
 import android.graphics.Bitmap;
 import android.graphics.Rect;
+import android.hardware.HardwareBuffer;
+import android.hardware.display.DisplayManagerInternal;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Process;
 import android.os.SystemClock;
 import android.os.SystemProperties;
+import android.util.RotationUtils;
 import android.util.Slog;
+import android.view.Display;
+import android.view.DisplayInfo;
+import android.view.Surface;
 import android.window.ScreenCaptureInternal;
+
+import com.android.server.LocalServices;
 
 import java.io.FileInputStream;
 import java.nio.charset.StandardCharsets;
@@ -138,6 +146,9 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
      */
     private static final HandlerThread CAPTURE_THREAD = createCaptureThread();
     private static final Handler CAPTURE_HANDLER = new Handler(CAPTURE_THREAD.getLooper());
+
+    /** Cached lazily; LocalServices may not have DisplayManagerInternal yet during early boot. */
+    private static volatile DisplayManagerInternal sDisplayManagerInternal;
 
     private final Object mLock = new Object();
 
@@ -293,9 +304,18 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
             return null;
         }
 
-        final float scale = (float) SAMPLE_EDGE / Math.max(crop.width(), crop.height());
-
         try {
+            // The capture sourceCrop is interpreted in layer-stack (logical, rotated) coordinates,
+            // while the sensor position is fixed in natural panel coordinates. Transform the crop
+            // the same way UDFPS transforms its sensor bounds, or a rotated UI would sample a
+            // screen region unrelated to the physical sensor.
+            final int rotation = getDisplayRotation();
+            if (rotation != Surface.ROTATION_0) {
+                RotationUtils.rotateBounds(crop, PANEL_WIDTH, PANEL_HEIGHT, rotation);
+            }
+
+            final float scale = (float) SAMPLE_EDGE / Math.max(crop.width(), crop.height());
+
             final long[] ids = DisplayControl.getPhysicalDisplayIds();
             if (ids == null || ids.length == 0) {
                 return null;
@@ -317,14 +337,24 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
                 return null;
             }
 
-            final Bitmap hw = buffer.asBitmap();
-            if (hw == null) {
-                return null;
+            // The HardwareBuffer owns a dmabuf file descriptor inside system_server. Close it
+            // deterministically: at up to several captures per second, leaving it to GC finalizers
+            // accumulates dead fds and native memory between collections.
+            try {
+                final Bitmap hw = buffer.asBitmap();
+                if (hw == null) {
+                    return null;
+                }
+                // asBitmap() returns a HARDWARE bitmap; getPixels() needs a software copy.
+                final Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
+                hw.recycle();
+                return sw;
+            } finally {
+                final HardwareBuffer hb = buffer.getHardwareBuffer();
+                if (hb != null) {
+                    hb.close();
+                }
             }
-            // asBitmap() returns a HARDWARE bitmap; getPixels() needs a software copy.
-            final Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
-            hw.recycle();
-            return sw;
         } catch (Throwable t) {
             if (!mCaptureFailedLogged) {
                 mCaptureFailedLogged = true;
@@ -393,14 +423,37 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
         }
     }
 
-    /** Publishes the operating state for settings UIs. Writes only on change. */
+    /** Current rotation of the built-in display, or ROTATION_0 when not yet available. */
+    private static int getDisplayRotation() {
+        DisplayManagerInternal dmi = sDisplayManagerInternal;
+        if (dmi == null) {
+            dmi = LocalServices.getService(DisplayManagerInternal.class);
+            if (dmi == null) {
+                return Surface.ROTATION_0;
+            }
+            sDisplayManagerInternal = dmi;
+        }
+        final DisplayInfo info = dmi.getDisplayInfo(Display.DEFAULT_DISPLAY);
+        return info != null ? info.rotation : Surface.ROTATION_0;
+    }
+
+    /**
+     * Publishes the operating state for settings UIs. Writes only on change. The property write is
+     * a blocking property-service socket round-trip, so it is posted to the capture thread instead
+     * of running on the DisplayPowerController looper; posting under the lock keeps the queue order
+     * identical to the mPublishedState order.
+     */
     private void publishState(String state) {
         synchronized (mLock) {
             if (state.equals(mPublishedState)) {
                 return;
             }
             mPublishedState = state;
+            CAPTURE_HANDLER.post(() -> setStateProp(state));
         }
+    }
+
+    private static void setStateProp(String state) {
         try {
             SystemProperties.set(STATE_PROP, state);
         } catch (RuntimeException e) {

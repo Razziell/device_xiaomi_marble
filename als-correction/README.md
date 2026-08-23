@@ -180,6 +180,13 @@ correctedLux = max(0, rawLux
 The display-power/ALS callback never waits for SurfaceFlinger, and no capture is requested while
 panel DBV is zero. Cached content is discarded when the panel turns off.
 
+The capture crop is transformed from natural panel coordinates into the current layer-stack
+rotation (the same way UDFPS transforms its sensor bounds), so landscape content is sampled at
+the physical sensor location. The screenshot `HardwareBuffer` (a dmabuf file descriptor inside
+`system_server`) is closed deterministically after each capture instead of waiting for GC, and
+state-property writes are posted to the capture thread so the DisplayPowerController looper never
+performs a property-service round-trip.
+
 ## Performance and power impact
 
 The arithmetic itself is negligible: each sample processes only a `16 x 16` bitmap (256
