@@ -91,8 +91,9 @@ sys.als_correction.state
 
 | Value | Meaning |
 |---|---|
-| `active` | Correction is being applied to incoming lux values. |
-| `capture_failed` | Screen capture unavailable (secure content, display off, SurfaceFlinger error); lux is passed through unmodified. |
+| `active` | A valid content capture is ready for correction. |
+| `capture_failed` | The last capture attempt actually failed (for example, secure content or a SurfaceFlinger error); lux is passed through unmodified. |
+| `idle` | The panel is off, so no screen capture is attempted. |
 | `off` | Disabled via `persist.sys.als_correction.enabled`. |
 
 An empty value means the corrector has not processed any ALS event since boot

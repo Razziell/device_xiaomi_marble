@@ -34,8 +34,9 @@
  *
  * The current operating state is published (on change only) in the read-only
  * property "sys.als_correction.state" for consumption by settings UIs:
- *   active         - correction is being applied
- *   capture_failed - screen capture unavailable, lux passed through
+ *   active         - a valid content capture is ready for correction
+ *   capture_failed - the last screen capture attempt actually failed
+ *   idle           - the panel is off; no capture is attempted
  *   off            - disabled via persist.sys.als_correction.enabled
  */
 
@@ -105,6 +106,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
     private static final String STATE_PROP = "sys.als_correction.state";
     private static final String STATE_ACTIVE = "active";
     private static final String STATE_CAPTURE_FAILED = "capture_failed";
+    private static final String STATE_IDLE = "idle";
     private static final String STATE_OFF = "off";
 
     /** Downscaled capture edge, in pixels. 16x16 = 256 samples, plenty for an average. */
@@ -159,17 +161,16 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
         final float dbvNorm = getBacklightNorm();
         if (dbvNorm <= 0f) {
             invalidateContentLuma();
-            publishState(STATE_CAPTURE_FAILED);
+            publishState(STATE_IDLE);
             return rawLux;
         }
 
         final float lumaNorm = getContentLumaNormAsync();
         if (lumaNorm < 0f) {
             // The first sample is deliberately passed through while the background capture runs.
-            publishState(STATE_CAPTURE_FAILED);
+            // Do not report a failure here: the asynchronous capture has not finished yet.
             return rawLux;
         }
-        publishState(STATE_ACTIVE);
 
         final float k = clamp(
                 SystemProperties.getInt("persist.sys.als_correction.k", DEF_K), K_MIN, K_MAX);
@@ -225,13 +226,21 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
             }
         }
 
+        final boolean accepted;
         synchronized (mLock) {
-            if (generation == mCaptureGeneration) {
+            accepted = generation == mCaptureGeneration;
+            if (accepted) {
                 mLastLumaNorm = luma;
                 // Rate-limit both successful captures and failures.
                 mLastCaptureUptime = SystemClock.uptimeMillis();
             }
             mCapturePending = false;
+        }
+
+        // Publish the actual result as soon as the asynchronous capture completes. Do not wait for
+        // another on-change ALS event, which may not arrive while ambient light remains stable.
+        if (accepted) {
+            publishState(luma >= 0f ? STATE_ACTIVE : STATE_CAPTURE_FAILED);
         }
     }
 
