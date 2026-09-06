@@ -46,21 +46,27 @@ private static DoubleUnaryOperator loadAlsCorrection() {
 }
 ```
 
-The light-sensor event is then passed through the operator:
+Finite, non-negative light-sensor events are passed through the operator. The framework
+validates its result and falls back to the original lux if correction returns an invalid
+value or throws a runtime/linkage exception.
 
-```java
-final float lux = (float) mAlsCorrection.applyAsDouble(event.values[0]);
-handleLightSensorEvent(time, lux);
-```
+The implementation also implements `Consumer<Boolean>`. The optional framework lifecycle
+hook calls `accept(true)` before registering the ALS listener and `accept(false)` when
+unregistering it. Each transition invalidates the content cache and in-flight generation.
+Enable schedules an immediate background prewarm; disable cancels queued refreshes. No final
+sensor event with DBV=0 is needed to discard pre-sleep content. Install the
+updated framework hook together with the JAR; this implementation needs the enable callback.
 
 If the property, JAR or implementation is missing, the operator is a no-op and stock
-automatic brightness behavior is preserved.
+automatic brightness behavior is preserved for valid sensor events. Implementations that
+only implement `DoubleUnaryOperator` remain supported without lifecycle notifications.
 
 ## Runtime parameters
 
 All calibration parameters are persistent system properties and are read at runtime.
 They do not require a reboot or framework restart. A changed value normally takes effect
-on the next ALS event or framebuffer sample.
+on the next ALS event or periodic framebuffer refresh. When correction is disabled but ALS
+is still enabled, a lightweight worker check detects re-enabling without needing a new ALS event.
 
 | Property | Default | Clamped to | Meaning |
 |---|---:|---:|---|
@@ -71,11 +77,12 @@ on the next ALS event or framebuffer sample.
 | `persist.sys.als_correction.cx` | `745` | `0..1079` | Sensor-area center X in natural panel coordinates. |
 | `persist.sys.als_correction.cy` | `51` | `0..2399` | Sensor-area center Y in natural panel coordinates. |
 | `persist.sys.als_correction.r` | `47` | `16..96` | Capture radius in natural panel pixels. |
-| `persist.sys.als_correction.interval_ms` | `250` | `100..5000` | Minimum time between captures, in milliseconds. |
+| `persist.sys.als_correction.interval_ms` | `250` | `100..5000` | Delay after a completed successful capture before refreshing again, in milliseconds. |
 
 Out-of-range values are clamped inside the corrector itself, so unvalidated writes via
 adb or a settings UI degrade gracefully instead of breaking auto-brightness. Malformed
-values (non-numeric strings) silently fall back to the compiled defaults. Note that the
+values (non-numeric strings, `NaN` or infinities) silently fall back to the compiled defaults.
+The settings UI also rejects non-finite values when reading overrides. Note that the
 float properties must use a dot as the decimal separator (`0.14`, not `0,14`).
 
 Recommended user-facing UI ranges are narrower than the hard clamps:
@@ -92,13 +99,16 @@ sys.als_correction.state
 
 | Value | Meaning |
 |---|---|
-| `active` | A valid content capture is ready for correction. |
+| `active` | A valid, fresh content capture is ready for correction. |
 | `capture_failed` | The last capture attempt actually failed (for example, secure content or a SurfaceFlinger error); lux is passed through unmodified. |
-| `idle` | The panel is off, so no screen capture is attempted. |
+| `idle` | The ALS listener is inactive or panel DBV is zero; no new capture is requested. |
 | `off` | Disabled via `persist.sys.als_correction.enabled`. |
 
-An empty value means the corrector has not processed any ALS event since boot
-(for example, auto-brightness has never been enabled).
+An empty value means fresh correction data is not available yet: before the first capture,
+after cache expiry or a very slow capture, or when DBV cannot be read. It does not indicate
+a capture failure. Lifecycle and refresh callbacks update the state; changes to persistent
+settings are observed on the next ALS event or refresh. The state is not a display-power API.
+Normal successful periodic captures keep `active` even if TYPE_LIGHT remains unchanged.
 
 The implementation class is selected at boot by the read-only product property:
 
@@ -165,6 +175,11 @@ They sum to 1, so the existing white/gray calibration and the user-facing `k` co
 preserved. Compared with Rec.709 human-vision weights, this reduces red over-correction and
 increases blue correction without changing the number or frequency of screen captures.
 
+The model remains deliberately conservative: with the default `ref_luma=0.14`, a pure blue
+sample (`contentLevel=0.0956`) is below the subtraction threshold. These weights do not by
+themselves guarantee complete cancellation for every color. Changing this baseline or using
+a circular/spatially weighted sample requires a separate calibration.
+
 The correction formula is approximately:
 
 ```text
@@ -177,40 +192,121 @@ correctedLux = max(0, rawLux
 ## Capture safety
 
 `ScreenCaptureInternal.captureDisplay()` runs asynchronously on a dedicated background thread.
-The display-power/ALS callback never waits for SurfaceFlinger, and no capture is requested while
-panel DBV is zero. Cached content is discarded when the panel turns off.
+The display-power/ALS callback never waits for SurfaceFlinger and does not schedule captures.
+The worker requires the default display to be `STATE_ON` (not OFF or doze), readable positive
+DBV, and the enable property before capture, and checks them again before accepting the result. Unknown DBV/max DBV
+passes through the original lux; it is never interpreted as maximum brightness. The maximum
+DBV read is retried until it succeeds. Small sysfs reads still run on the ALS callback looper.
+
+Both ALS lifecycle transitions discard cached content and invalidate in-flight results. A
+queued obsolete request is skipped, and at most one capture per corrector may be pending.
+Captures have a hard maximum age of **2000 ms**, measured from the start of capture using
+`elapsedRealtime()` (which includes suspend). Old content is never used while waiting for
+an update, and a capture taking 2000 ms or longer is not accepted as fresh data. Expiry is
+also published independently of both ALS delivery and the capture worker. With intervals above
+2000 ms there can deliberately be gaps with no usable correction data; the recommended UI
+intervals are 250/500/1000 ms.
+
+### Refresh independent of on-change ALS
+
+Device measurements showed gaps of tens of seconds between TYPE_LIGHT events despite a
+500 ms requested sensor period. An event-driven capture with a 2-second TTL therefore left
+the first lux after every long pause uncorrected, even while the screen remained on.
+
+The worker now refreshes periodically while the ALS listener is enabled. The first request
+is scheduled at listener enable, and each completed request schedules at most one successor.
+Successful requests wait `interval_ms` after completion: no overlapping captures, catch-up
+bursts, or queue growth if SurfaceFlinger is slow. Captures only update the content cache;
+they never inject synthetic sensor events, reuse old lux, or force brightness updates.
+The next real ALS event consumes the latest fresh content with the current DBV.
+
+Disabled correction, OFF/doze, unavailable DBV and capture failures use a retry delay of
+`max(interval_ms, 1000)` ms. Disabled correction checks only its enable property (no display,
+sysfs or capture work). This allows live re-enabling to recover even with no TYPE_LIGHT event.
+When the ALS listener is disabled, **all queued refreshes are cancelled**: no polling,
+capture or wake lock is kept for an inactive listener. An already running capture cannot
+be cancelled, but its old-generation result is discarded. Re-enabling during that capture
+schedules a fresh prewarm as soon as it finishes.
+
+The first ALS event immediately after wake can still precede the first successful capture;
+it intentionally passes through rather than using pre-sleep content or blocking the display.
+A capture also cannot undo redaction, account for every post-composition panel transform,
+or guarantee pixel/sensor timestamp alignment. This is a bounded-delay compensation model.
+
+Secure and protected-content policies explicitly reject the capture, rather than treating
+redacted black pixels as actual panel emission. Protected pixels are never requested.
 
 The capture crop is transformed from natural panel coordinates into the current layer-stack
 rotation (the same way UDFPS transforms its sensor bounds), so landscape content is sampled at
 the physical sensor location. The screenshot `HardwareBuffer` (a dmabuf file descriptor inside
 `system_server`) is closed deterministically after each capture instead of waiting for GC, and
-state-property writes are posted to the capture thread so the DisplayPowerController looper never
-performs a property-service round-trip.
+state decisions are made under the same lock as generation checks. Property writes are coalesced
+on a separate background handler: the DisplayPowerController looper never performs a
+property-service round-trip, and state updates are not queued behind a stalled capture.
 
 ## Performance and power impact
 
-The arithmetic itself is negligible: each sample processes only a `16 x 16` bitmap (256
-pixels), followed by a short sysfs read. The main cost is the synchronous
+The arithmetic itself is small: each sample processes only a `16 x 16` bitmap (256
+pixels); DBV is read on the ALS callback and around each capture. The main cost is the synchronous
 `ScreenCaptureInternal.captureDisplay()` request to SurfaceFlinger.
 
 At defaults:
 
-* capture is limited to at most **4 times per second** (`interval_ms=250`);
+* with the default `interval_ms=250`, capture is limited to at most **4 times per second**;
 * only a roughly `94 x 94` source region is requested and downscaled to `16 x 16`;
-* work runs only when `AutomaticBrightnessController` has enabled its light-sensor listener;
-* disabling correction returns before framebuffer capture and DBV reads;
+* new capture requests run only while the ALS listener is enabled; an already running capture
+  may finish after disable, but its result is discarded;
+* a disabled correction bypasses DBV reads and captures; while ALS is enabled it retains
+  only a low-rate property check to notice live re-enabling;
 * capture failure or secure/unavailable content safely falls back to unmodified lux.
 
-The expected impact is small but not zero. CPU work and temporary Java memory are tiny;
-SurfaceFlinger/GPU synchronization dominates. Exact power cost depends on composer behavior,
+Periodic sampling intentionally performs more captures under stable light than the old
+ALS-event-driven implementation. Its power cost must be measured, not assumed unchanged.
+CPU arithmetic and temporary Java memory are small; SurfaceFlinger/GPU synchronization dominates. Exact power cost depends on composer behavior,
 refresh rate and panel state, so it should be measured rather than inferred from source alone.
 The current implementation has not been assigned a laboratory mW figure.
 
 For a lower-power compromise use `interval_ms=500` (maximum 2 captures/s) or `1000`
 (maximum 1 capture/s). This makes correction respond more slowly to content changes. Setting
-`enabled=false` removes virtually all runtime overhead except one property lookup per ALS event.
+`enabled=false` removes capture and DBV work after any already running capture finishes;
+only lightweight validation/property checks remain. Disabling the ALS listener stops the
+refresh timer entirely.
 
-Useful validation commands:
+## Diagnostics and validation
+
+The framework dump prints the corrector snapshot without extra reflection or log spam:
+
+```sh
+adb shell dumpsys display | grep 'mAlsCorrection='
+```
+
+Important fields:
+
+* `enableCount`, `disableCount`, `lastEnableElapsedMs`, `lastDisableElapsedMs`: listener
+  lifecycle history since this corrector instance was created; timestamps include suspend.
+* `generation`: invalidation generation. Old-generation results are never used.
+* `capturePending`: a refresh is in progress (including its availability checks).
+* `refreshScheduled`: a refresh is queued. After listener disable this must be false.
+* `cacheAgeMs`, `cacheValid`, `contentLevel`: the current sample; age -1 means absent.
+* `captures`, `successes`, `failures`, `discarded`, `expired`: completed attempt counters,
+  accepted successes, capture failures, unusable/obsolete results and expired cached samples.
+* `lastCaptureAgeMs`, `lastCaptureDurationMs`: time since completion and processing duration
+  of the last attempted capture, including its availability checks.
+* `alsSamples`, `lastAlsAgeMs`, `lastRawLux`, `lastCorrectedLux`: actual sensor callbacks.
+* `lastUsedCacheAgeMs`: age of content used for the last ALS callback; -1 means passthrough
+  without a usable sample. A valid sample can still subtract zero below the reference threshold.
+
+With a stable scene and no ALS events, `successes` should continue increasing, the cache
+should remain fresh at recommended intervals, and `alsSamples` should remain unchanged.
+After disabling the screen/ALS, `disableCount` should increment, cache should be invalid,
+and captures should stop (apart from one already in flight). On re-enable, `enableCount`
+increments and a new capture is scheduled. Compare snapshots around the transition; a
+post-wake dump alone is not proof that no capture happened during the entire sleep interval.
+
+These fields do not validate the RGB calibration or measure power consumption. Avoid
+changing sensor/brightness settings merely to query them.
+
+Additional validation commands (the `setprop` examples modify settings):
 
 ```sh
 adb shell dumpsys display | grep -i -E 'ambient|lux|brightness'

@@ -14,7 +14,7 @@
  *   UI leaks far more light than the calibrated average, and a dark UI far less.
  *   Measured on marble at fixed DBV=4095: raw ALS 497 on white vs 181 on black.
  *
- *   This class samples the actual framebuffer content in the small disc above the
+ *   This class samples the actual framebuffer content in a small region above the
  *   sensor (position taken from vendor lightSensorConfig.json "cwbInfo") and removes
  *   the residual, content dependent part of the leakage.
  *
@@ -36,8 +36,9 @@
  * property "sys.als_correction.state" for consumption by settings UIs:
  *   active         - a valid content capture is ready for correction
  *   capture_failed - the last screen capture attempt actually failed
- *   idle           - the panel is off; no capture is attempted
+ *   idle           - the panel is off or the ALS listener is inactive
  *   off            - disabled via persist.sys.als_correction.enabled
+ *   empty          - waiting for fresh content or a readable DBV
  */
 
 package com.android.server.display;
@@ -57,19 +58,22 @@ import android.util.Slog;
 import android.view.Display;
 import android.view.DisplayInfo;
 import android.view.Surface;
+import android.window.ScreenCapture.ScreenCaptureParams;
 import android.window.ScreenCaptureInternal;
 
+import com.android.internal.os.BackgroundThread;
 import com.android.server.LocalServices;
 
 import java.io.FileInputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.function.Consumer;
 import java.util.function.DoubleUnaryOperator;
 
 /**
  * Removes display self-illumination from under-display ALS readings by measuring the
  * content actually displayed above the sensor.
  */
-public final class MarbleAlsCorrection implements DoubleUnaryOperator {
+public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<Boolean> {
     private static final String TAG = "MarbleAlsCorrection";
     private static final boolean DEBUG = false;
 
@@ -127,12 +131,19 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
     private static final String STATE_CAPTURE_FAILED = "capture_failed";
     private static final String STATE_IDLE = "idle";
     private static final String STATE_OFF = "off";
+    private static final String STATE_PENDING = "";
 
     /** Downscaled capture edge, in pixels. 16x16 = 256 samples, plenty for an average. */
     private static final int SAMPLE_EDGE = 16;
 
-    /** Do not re-capture more often than this. The ALS itself reports at ~5 Hz. */
+    /** Delay after a completed capture; independent of on-change ALS event delivery. */
     private static final long MIN_CAPTURE_INTERVAL_MS = 250;
+
+    /** Retry unavailable/disabled content without hammering SurfaceFlinger or polling rapidly. */
+    private static final long RETRY_INTERVAL_MS = 1000;
+
+    /** Never subtract leakage from content sampled before a long gap or a slow capture. */
+    private static final long MAX_CONTENT_AGE_MS = 2000;
 
     private static final String BACKLIGHT_PATH =
             "/sys/class/backlight/panel0-backlight/brightness";
@@ -146,21 +157,79 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
      */
     private static final HandlerThread CAPTURE_THREAD = createCaptureThread();
     private static final Handler CAPTURE_HANDLER = new Handler(CAPTURE_THREAD.getLooper());
+    // State updates must not wait behind a stalled capture (including its expiry notification).
+    private static final Handler STATE_HANDLER = BackgroundThread.getHandler();
 
     /** Cached lazily; LocalServices may not have DisplayManagerInternal yet during early boot. */
     private static volatile DisplayManagerInternal sDisplayManagerInternal;
 
     private final Object mLock = new Object();
 
-    private long mLastCaptureUptime;
+    // Cache/lifecycle fields are guarded by mLock. elapsedRealtime includes time spent asleep.
+    private long mLastCaptureElapsed = -1;
+    private long mLastCaptureDurationMs = -1;
+    private long mLastLumaElapsed = -1;
     private float mLastLumaNorm = -1f;
     private boolean mCapturePending;
+    private boolean mRefreshScheduled;
+    private boolean mLightSensorEnabled;
     private int mCaptureGeneration;
-    private float mMaxBacklight = 4095f;
-    private boolean mMaxBacklightRead;
+    private long mLastEnableElapsed = -1;
+    private long mLastDisableElapsed = -1;
+    private long mEnableCount;
+    private long mDisableCount;
+    private long mCaptureAttempts;
+    private long mCaptureSuccesses;
+    private long mCaptureFailures;
+    private long mDiscardedCaptures;
+    private long mExpiredSamples;
+    private long mAlsSamples;
+    private long mLastAlsElapsed = -1;
+    private float mLastRawLux = Float.NaN;
+    private float mLastCorrectedLux = Float.NaN;
+    private long mLastUsedCacheAgeMs = -1;
+    // Only accessed on the ALS callback looper. Retry sysfs until a valid maximum is available.
+    private float mMaxBacklight = -1f;
     private boolean mCaptureFailedLogged;
-    private String mPublishedState = "";
+    private String mRequestedState;
+    private final Runnable mRefreshContent = this::updateContentLuma;
+    private final Runnable mExpireContent = this::expireContent;
+    private final Runnable mPublishState = () -> {
+        final String state;
+        synchronized (mLock) {
+            state = mRequestedState;
+        }
+        setStateProp(state);
+    };
+
     public MarbleAlsCorrection() {}
+
+    /** Optional framework hook: notify us before enabling/disabling the ALS listener. */
+    @Override
+    public void accept(Boolean enabled) {
+        synchronized (mLock) {
+            mLightSensorEnabled = Boolean.TRUE.equals(enabled);
+            if (mLightSensorEnabled) {
+                mLastEnableElapsed = SystemClock.elapsedRealtime();
+                mEnableCount++;
+            } else {
+                mLastDisableElapsed = SystemClock.elapsedRealtime();
+                mDisableCount++;
+            }
+            CAPTURE_HANDLER.removeCallbacks(mRefreshContent);
+            mRefreshScheduled = false;
+            invalidateContentLumaLocked();
+            publishStateLocked(!isCorrectionEnabled() ? STATE_OFF
+                    : mLightSensorEnabled ? STATE_PENDING : STATE_IDLE);
+            // Prewarm before the first ALS event. A running old generation will arrange the
+            // new refresh when it finishes; never queue parallel or duplicate captures.
+            scheduleRefreshLocked(0);
+        }
+    }
+
+    private static boolean isCorrectionEnabled() {
+        return SystemProperties.getBoolean("persist.sys.als_correction.enabled", true);
+    }
 
     /**
      * @param rawLux lux as reported by the (already backlight-compensated) sensor
@@ -168,29 +237,48 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
      */
     @Override
     public double applyAsDouble(double rawLux) {
-        return correct((float) rawLux);
+        synchronized (mLock) {
+            mLastUsedCacheAgeMs = -1;
+        }
+        final float correctedLux = correct((float) rawLux);
+        synchronized (mLock) {
+            mAlsSamples++;
+            mLastAlsElapsed = SystemClock.elapsedRealtime();
+            mLastRawLux = (float) rawLux;
+            mLastCorrectedLux = correctedLux;
+        }
+        return correctedLux;
     }
 
     private float correct(float rawLux) {
-        if (!SystemProperties.getBoolean("persist.sys.als_correction.enabled", true)) {
-            invalidateContentLuma();
-            publishState(STATE_OFF);
+        if (!Float.isFinite(rawLux) || rawLux < 0f) {
             return rawLux;
         }
+        final boolean correctionEnabled = isCorrectionEnabled();
+        synchronized (mLock) {
+            if (!correctionEnabled || !mLightSensorEnabled) {
+                invalidateContentLumaLocked();
+                publishStateLocked(!correctionEnabled ? STATE_OFF : STATE_IDLE);
+                return rawLux;
+            }
+        }
 
-        // Read DBV before requesting a screenshot. ALS can remain enabled in doze; attempting a
-        // display capture while the panel is off or transitioning is both useless and unsafe.
+        // Use current DBV, not the brightness at the time of the cached capture. The worker
+        // independently checks the display state and DBV before/after every capture.
         final float dbvNorm = getBacklightNorm();
         if (dbvNorm <= 0f) {
-            invalidateContentLuma();
-            publishState(STATE_IDLE);
+            synchronized (mLock) {
+                invalidateContentLumaLocked();
+                // An unreadable DBV is unknown, not full brightness or proof of screen OFF.
+                publishStateLocked(dbvNorm == 0f ? STATE_IDLE : STATE_PENDING);
+            }
             return rawLux;
         }
 
-        final float lumaNorm = getContentLumaNormAsync();
+        final float lumaNorm = getFreshContentLuma();
         if (lumaNorm < 0f) {
-            // The first sample is deliberately passed through while the background capture runs.
-            // Do not report a failure here: the asynchronous capture has not finished yet.
+            // No fresh sample: pass through until a background capture succeeds.
+            // This is not necessarily a capture failure.
             return rawLux;
         }
 
@@ -207,74 +295,164 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
             Slog.d(TAG, "raw=" + rawLux + " luma=" + lumaNorm + " dbv=" + dbvNorm
                     + " leak=" + leakage + " -> " + corrected);
         }
-        return corrected;
+        return Float.isFinite(corrected) ? corrected : rawLux;
     }
 
-    /**
-     * Returns the most recent content sample without blocking the caller and schedules an updated
-     * capture when the cache expires. The caller is the DisplayPowerController looper.
-     */
-    private float getContentLumaNormAsync() {
-        final long now = SystemClock.uptimeMillis();
-        final long captureIntervalMs = clamp(
-                SystemProperties.getInt("persist.sys.als_correction.interval_ms",
-                        (int) MIN_CAPTURE_INTERVAL_MS), INTERVAL_MIN_MS, INTERVAL_MAX_MS);
-        final int generation;
+    /** Read-only cache consumption: ALS callbacks never schedule or wait for a capture. */
+    private float getFreshContentLuma() {
         synchronized (mLock) {
-            if (now - mLastCaptureUptime < captureIntervalMs) {
-                return mLastLumaNorm;
+            final long now = SystemClock.elapsedRealtime();
+            expireContentLocked(now);
+            if (mLastLumaNorm >= 0f) {
+                mLastUsedCacheAgeMs = now - mLastLumaElapsed;
             }
-            if (mCapturePending) {
-                return mLastLumaNorm;
-            }
-            mCapturePending = true;
-            generation = mCaptureGeneration;
-        }
-        CAPTURE_HANDLER.post(() -> updateContentLuma(generation));
-        synchronized (mLock) {
             return mLastLumaNorm;
         }
     }
 
-    /** Performs the potentially blocking SurfaceFlinger transaction off the display-power looper. */
-    private void updateContentLuma(int generation) {
-        final Bitmap bitmap = captureSensorRegion();
-        float luma = -1f;
-        if (bitmap != null) {
-            try {
-                luma = averageLuma(bitmap);
-            } finally {
-                bitmap.recycle();
-            }
-        }
+    private static long getCaptureIntervalMs() {
+        return clamp(SystemProperties.getInt("persist.sys.als_correction.interval_ms",
+                (int) MIN_CAPTURE_INTERVAL_MS), INTERVAL_MIN_MS, INTERVAL_MAX_MS);
+    }
 
-        final boolean accepted;
+    /** Caller holds mLock. Scheduling is completion-based: no backlog or catch-up burst. */
+    private void scheduleRefreshLocked(long delayMs) {
+        if (!mLightSensorEnabled || mCapturePending) {
+            return;
+        }
+        CAPTURE_HANDLER.removeCallbacks(mRefreshContent);
+        mRefreshScheduled = CAPTURE_HANDLER.postDelayed(mRefreshContent, delayMs);
+    }
+
+    /** Runs solely on the capture worker, even if no TYPE_LIGHT event arrives for minutes. */
+    private void updateContentLuma() {
+        final int generation;
         synchronized (mLock) {
-            accepted = generation == mCaptureGeneration;
-            if (accepted) {
-                mLastLumaNorm = luma;
-                // Rate-limit both successful captures and failures.
-                mLastCaptureUptime = SystemClock.uptimeMillis();
+            // Coalesce a prewarm posted while this runnable was already being dispatched.
+            CAPTURE_HANDLER.removeCallbacks(mRefreshContent);
+            mRefreshScheduled = false;
+            if (!mLightSensorEnabled || mCapturePending) {
+                return;
             }
-            mCapturePending = false;
+            mCapturePending = true;
+            generation = mCaptureGeneration;
         }
 
-        // Publish the actual result as soon as the asynchronous capture completes. Do not wait for
-        // another on-change ALS event, which may not arrive while ambient light remains stable.
-        if (accepted) {
-            publishState(luma >= 0f ? STATE_ACTIVE : STATE_CAPTURE_FAILED);
+        final long captureStarted = SystemClock.elapsedRealtime();
+        float luma = -1f;
+        boolean attempted = false;
+        String unavailableState = STATE_PENDING;
+        try {
+            // Skip expensive work when disabled, screen OFF/dozing, or DBV is unreadable.
+            unavailableState = getUnavailableState();
+            if (unavailableState == null) {
+                attempted = true;
+                final Bitmap bitmap = captureSensorRegion();
+                if (bitmap != null) {
+                    try {
+                        luma = averageLuma(bitmap);
+                    } finally {
+                        bitmap.recycle();
+                    }
+                }
+                unavailableState = getUnavailableState();
+            }
+        } catch (RuntimeException | LinkageError e) {
+            logCaptureFailure(e);
+            luma = -1f;
+            unavailableState = STATE_CAPTURE_FAILED;
+        } finally {
+            synchronized (mLock) {
+                mCapturePending = false;
+                final long now = SystemClock.elapsedRealtime();
+                if (attempted) {
+                    mCaptureAttempts++;
+                    mLastCaptureElapsed = now;
+                    mLastCaptureDurationMs = now - captureStarted;
+                }
+                final boolean accepted = generation == mCaptureGeneration && mLightSensorEnabled;
+                long nextDelayMs = Math.max(getCaptureIntervalMs(), RETRY_INTERVAL_MS);
+                if (!accepted) {
+                    if (attempted) {
+                        mDiscardedCaptures++;
+                    }
+                    // A disable/enable cycle during capture needs a new-generation prewarm.
+                    nextDelayMs = 0;
+                } else {
+                    clearContentLumaLocked();
+                    if (unavailableState != null) {
+                        if (attempted) {
+                            if (STATE_CAPTURE_FAILED.equals(unavailableState)) {
+                                mCaptureFailures++;
+                            } else {
+                                mDiscardedCaptures++;
+                            }
+                        }
+                        publishStateLocked(unavailableState);
+                    } else if (!Float.isFinite(luma) || luma < 0f) {
+                        mCaptureFailures++;
+                        publishStateLocked(STATE_CAPTURE_FAILED);
+                    } else if (now - captureStarted >= MAX_CONTENT_AGE_MS) {
+                        mDiscardedCaptures++;
+                        publishStateLocked(STATE_PENDING);
+                    } else {
+                        mLastLumaNorm = luma;
+                        mLastLumaElapsed = captureStarted;
+                        mCaptureSuccesses++;
+                        mCaptureFailedLogged = false;
+                        publishStateLocked(STATE_ACTIVE);
+                        STATE_HANDLER.postDelayed(mExpireContent,
+                                MAX_CONTENT_AGE_MS - (now - captureStarted));
+                        nextDelayMs = getCaptureIntervalMs();
+                    }
+                }
+                // Disabled correction polls only its property; disabled ALS stops all work.
+                // This also recovers after a live property change without needing an ALS event.
+                scheduleRefreshLocked(nextDelayMs);
+            }
         }
     }
 
-    /** Drops content captured before/while the panel was turned off. */
-    private void invalidateContentLuma() {
-        synchronized (mLock) {
-            if (mLastLumaNorm >= 0f || mCapturePending) {
-                mCaptureGeneration++;
-                mLastLumaNorm = -1f;
-                mLastCaptureUptime = 0;
-            }
+    /** null means capture is usable; an empty state means display/DBV information is unavailable. */
+    private static String getUnavailableState() {
+        if (!isCorrectionEnabled()) {
+            return STATE_OFF;
         }
+        final DisplayInfo info = getDefaultDisplayInfo();
+        if (info == null) {
+            return STATE_PENDING;
+        }
+        if (info.state != Display.STATE_ON) {
+            return STATE_IDLE;
+        }
+        final float dbv = readSysfsFloat(BACKLIGHT_PATH);
+        return dbv < 0f ? STATE_PENDING : dbv == 0f ? STATE_IDLE : null;
+    }
+
+    private void expireContent() {
+        synchronized (mLock) {
+            expireContentLocked(SystemClock.elapsedRealtime());
+        }
+    }
+
+    private void expireContentLocked(long now) {
+        if (mLastLumaNorm >= 0f && now - mLastLumaElapsed >= MAX_CONTENT_AGE_MS) {
+            mExpiredSamples++;
+            clearContentLumaLocked();
+            publishStateLocked(STATE_PENDING);
+        }
+    }
+
+    /** Caller holds mLock. Keep pending set until the old worker exits; never queue duplicates. */
+    private void invalidateContentLumaLocked() {
+        mCaptureGeneration++;
+        clearContentLumaLocked();
+    }
+
+    private void clearContentLumaLocked() {
+        mLastLumaNorm = -1f;
+        mLastLumaElapsed = -1;
+        STATE_HANDLER.removeCallbacks(mExpireContent);
     }
 
     private static HandlerThread createCaptureThread() {
@@ -329,6 +507,12 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
                     new ScreenCaptureInternal.DisplayCaptureArgs.Builder(token)
                             .setSourceCrop(crop)
                             .setFrameScale(scale)
+                            // Redaction would look like real black pixels to the ALS model.
+                            // Reject unavailable content instead; never capture secure/DRM pixels.
+                            .setSecureContentPolicy(
+                                    ScreenCaptureParams.SECURE_CONTENT_POLICY_THROW_EXCEPTION)
+                            .setProtectedContentPolicy(
+                                    ScreenCaptureParams.PROTECTED_CONTENT_POLICY_THROW_EXCEPTION)
                             .build();
 
             final ScreenCaptureInternal.ScreenshotHardwareBuffer buffer =
@@ -346,21 +530,27 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
                     return null;
                 }
                 // asBitmap() returns a HARDWARE bitmap; getPixels() needs a software copy.
-                final Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
-                hw.recycle();
-                return sw;
+                try {
+                    return hw.copy(Bitmap.Config.ARGB_8888, false);
+                } finally {
+                    hw.recycle();
+                }
             } finally {
                 final HardwareBuffer hb = buffer.getHardwareBuffer();
                 if (hb != null) {
                     hb.close();
                 }
             }
-        } catch (Throwable t) {
-            if (!mCaptureFailedLogged) {
-                mCaptureFailedLogged = true;
-                Slog.w(TAG, "screen capture unavailable, correction disabled", t);
-            }
+        } catch (RuntimeException | LinkageError e) {
+            logCaptureFailure(e);
             return null;
+        }
+    }
+
+    private void logCaptureFailure(Throwable error) {
+        if (!mCaptureFailedLogged) {
+            mCaptureFailedLogged = true;
+            Slog.w(TAG, "screen capture unavailable, passing through unmodified lux", error);
         }
     }
 
@@ -394,20 +584,16 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
         return (float) (sum / pixels.length);
     }
 
-    /** Current panel DBV normalized to 0..1, or 1.0 if it cannot be read. */
+    /** Current panel DBV normalized to 0..1, or -1 if it cannot be read reliably. */
     private float getBacklightNorm() {
-        if (!mMaxBacklightRead) {
-            mMaxBacklightRead = true;
-            final float max = readSysfsFloat(MAX_BACKLIGHT_PATH);
-            if (max > 0f) {
-                mMaxBacklight = max;
-            }
-        }
         final float cur = readSysfsFloat(BACKLIGHT_PATH);
-        if (cur < 0f) {
-            return 1f;
+        if (cur <= 0f) {
+            return cur;
         }
-        return Math.min(1f, cur / mMaxBacklight);
+        if (mMaxBacklight <= 0f) {
+            mMaxBacklight = readSysfsFloat(MAX_BACKLIGHT_PATH);
+        }
+        return mMaxBacklight > 0f ? Math.min(1f, cur / mMaxBacklight) : -1f;
     }
 
     private static float readSysfsFloat(String path) {
@@ -417,7 +603,9 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
             if (n <= 0) {
                 return -1f;
             }
-            return Float.parseFloat(new String(buf, 0, n, StandardCharsets.UTF_8).trim());
+            final float value = Float.parseFloat(
+                    new String(buf, 0, n, StandardCharsets.UTF_8).trim());
+            return Float.isFinite(value) && value >= 0f ? value : -1f;
         } catch (Exception e) {
             return -1f;
         }
@@ -425,32 +613,71 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
 
     /** Current rotation of the built-in display, or ROTATION_0 when not yet available. */
     private static int getDisplayRotation() {
+        final DisplayInfo info = getDefaultDisplayInfo();
+        return info != null ? info.rotation : Surface.ROTATION_0;
+    }
+
+    private static DisplayInfo getDefaultDisplayInfo() {
         DisplayManagerInternal dmi = sDisplayManagerInternal;
         if (dmi == null) {
             dmi = LocalServices.getService(DisplayManagerInternal.class);
             if (dmi == null) {
-                return Surface.ROTATION_0;
+                return null;
             }
             sDisplayManagerInternal = dmi;
         }
-        final DisplayInfo info = dmi.getDisplayInfo(Display.DEFAULT_DISPLAY);
-        return info != null ? info.rotation : Surface.ROTATION_0;
+        return dmi.getDisplayInfo(Display.DEFAULT_DISPLAY);
+    }
+
+    /** Compact snapshot used by AutomaticBrightnessController.dump(); no I/O or state changes. */
+    @Override
+    public String toString() {
+        synchronized (mLock) {
+            final long now = SystemClock.elapsedRealtime();
+            final long cacheAgeMs = ageMs(now, mLastLumaElapsed);
+            return "MarbleAlsCorrection{state="
+                    + (mRequestedState == null || mRequestedState.isEmpty()
+                            ? "pending" : mRequestedState)
+                    + ", alsEnabled=" + mLightSensorEnabled
+                    + ", generation=" + mCaptureGeneration
+                    + ", enableCount=" + mEnableCount + ", disableCount=" + mDisableCount
+                    + ", lastEnableElapsedMs=" + mLastEnableElapsed
+                    + ", lastDisableElapsedMs=" + mLastDisableElapsed
+                    + ", capturePending=" + mCapturePending
+                    + ", refreshScheduled=" + mRefreshScheduled
+                    + ", cacheAgeMs=" + cacheAgeMs
+                    + ", cacheValid=" + (mLastLumaNorm >= 0f && cacheAgeMs >= 0
+                            && cacheAgeMs < MAX_CONTENT_AGE_MS)
+                    + ", contentLevel=" + mLastLumaNorm
+                    + ", lastCaptureAgeMs=" + ageMs(now, mLastCaptureElapsed)
+                    + ", lastCaptureDurationMs=" + mLastCaptureDurationMs
+                    + ", captures=" + mCaptureAttempts + ", successes=" + mCaptureSuccesses
+                    + ", failures=" + mCaptureFailures + ", discarded=" + mDiscardedCaptures
+                    + ", expired=" + mExpiredSamples
+                    + ", alsSamples=" + mAlsSamples
+                    + ", lastAlsAgeMs=" + ageMs(now, mLastAlsElapsed)
+                    + ", lastRawLux=" + mLastRawLux + ", lastCorrectedLux=" + mLastCorrectedLux
+                    + ", lastUsedCacheAgeMs=" + mLastUsedCacheAgeMs
+                    + "}";
+        }
+    }
+
+    private static long ageMs(long now, long timestamp) {
+        return timestamp < 0 ? -1 : now - timestamp;
     }
 
     /**
-     * Publishes the operating state for settings UIs. Writes only on change. The property write is
-     * a blocking property-service socket round-trip, so it is posted to the capture thread instead
-     * of running on the DisplayPowerController looper; posting under the lock keeps the queue order
-     * identical to the mPublishedState order.
+     * Caller holds mLock, including when checking capture generation and accepting a result.
+     * Coalesce queued updates; the writer reads the latest desired state, never a stale capture's
+     * state. A separate background handler keeps property I/O off the display/capture loopers.
      */
-    private void publishState(String state) {
-        synchronized (mLock) {
-            if (state.equals(mPublishedState)) {
-                return;
-            }
-            mPublishedState = state;
-            CAPTURE_HANDLER.post(() -> setStateProp(state));
+    private void publishStateLocked(String state) {
+        if (state.equals(mRequestedState)) {
+            return;
         }
+        mRequestedState = state;
+        STATE_HANDLER.removeCallbacks(mPublishState);
+        STATE_HANDLER.post(mPublishState);
     }
 
     private static void setStateProp(String state) {
@@ -473,7 +700,8 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator {
     private static float getFloatProp(String key, float def) {
         try {
             final String v = SystemProperties.get(key);
-            return (v == null || v.isEmpty()) ? def : Float.parseFloat(v);
+            final float value = (v == null || v.isEmpty()) ? def : Float.parseFloat(v);
+            return Float.isFinite(value) ? value : def;
         } catch (NumberFormatException e) {
             return def;
         }

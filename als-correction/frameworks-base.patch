@@ -1,5 +1,5 @@
 diff --git a/services/core/java/com/android/server/display/AutomaticBrightnessController.java b/services/core/java/com/android/server/display/AutomaticBrightnessController.java
-index b8b4758277b2..d8897522f81e 100644
+index b8b4758277b2..c70d80013e58 100644
 --- a/services/core/java/com/android/server/display/AutomaticBrightnessController.java
 +++ b/services/core/java/com/android/server/display/AutomaticBrightnessController.java
 @@ -43,6 +43,7 @@ import android.os.Message;
@@ -10,20 +10,77 @@ index b8b4758277b2..d8897522f81e 100644
  import android.os.Trace;
  import android.util.EventLog;
  import android.util.IndentingPrintWriter;
-@@ -65,6 +66,7 @@ import java.io.PrintWriter;
+@@ -65,6 +66,8 @@ import java.io.PrintWriter;
  import java.lang.annotation.Retention;
  import java.lang.annotation.RetentionPolicy;
  import java.util.concurrent.TimeUnit;
++import java.util.function.Consumer;
 +import java.util.function.DoubleUnaryOperator;
  
  /**
   * Manages the associated display brightness when in auto-brightness mode. This is also
-@@ -1436,13 +1438,35 @@ public class AutomaticBrightnessController {
+@@ -628,6 +631,7 @@ public class AutomaticBrightnessController {
+         pw.println("Automatic Brightness Controller Configuration:");
+         pw.println("----------------------------------------------");
+         ipw.println("mState=" + configStateToString(mState));
++        ipw.println("mAlsCorrection=" + mAlsCorrection);
+         ipw.println("mScreenBrightnessRangeMinimum=" + mScreenBrightnessRangeMinimum);
+         ipw.println("mScreenBrightnessRangeMaximum=" + mScreenBrightnessRangeMaximum);
+         ipw.println("mDozeScaleFactor=" + mDozeScaleFactor);
+@@ -722,6 +726,7 @@ public class AutomaticBrightnessController {
+         if (enable) {
+             if (!mLightSensorEnabled) {
+                 mLightSensorEnabled = true;
++                notifyAlsCorrectionLightSensorEnabled(true);
+                 mLightSensorEnableTime = mClock.uptimeMillis();
+                 mCurrentLightSensorRate = mInitialLightSensorRate;
+                 registerForegroundAppUpdater();
+@@ -731,6 +736,7 @@ public class AutomaticBrightnessController {
+             }
+         } else if (mLightSensorEnabled) {
+             mLightSensorEnabled = false;
++            notifyAlsCorrectionLightSensorEnabled(false);
+             mAmbientLuxValid = !mResetAmbientLuxAfterWarmUpConfig;
+             if (!mAmbientLuxValid) {
+                 mPreThresholdLux = PowerManager.BRIGHTNESS_INVALID_FLOAT;
+@@ -1436,13 +1442,70 @@ public class AutomaticBrightnessController {
          }
      }
  
 +    /** Optional device-specific correction loaded from SYSTEMSERVERCLASSPATH. */
 +    private final DoubleUnaryOperator mAlsCorrection = loadAlsCorrection();
++    private boolean mAlsCorrectionFailureLogged;
++
++    /** Optional Consumer<Boolean> contract: reset correction state on ALS lifecycle transitions. */
++    @SuppressWarnings("unchecked")
++    private void notifyAlsCorrectionLightSensorEnabled(boolean enabled) {
++        if (mAlsCorrection instanceof Consumer<?>) {
++            try {
++                ((Consumer<Boolean>) mAlsCorrection).accept(enabled);
++            } catch (RuntimeException | LinkageError e) {
++                logAlsCorrectionFailure(e);
++            }
++        }
++    }
++
++    private float correctAmbientLux(float rawLux) {
++        try {
++            final float correctedLux = (float) mAlsCorrection.applyAsDouble(rawLux);
++            if (Float.isFinite(correctedLux) && correctedLux >= 0f) {
++                return correctedLux;
++            }
++        } catch (RuntimeException | LinkageError e) {
++            logAlsCorrectionFailure(e);
++        }
++        return rawLux;
++    }
++
++    private void logAlsCorrectionFailure(Throwable error) {
++        if (!mAlsCorrectionFailureLogged) {
++            mAlsCorrectionFailureLogged = true;
++            Slog.w(TAG, "ALS correction failed, using unmodified lux", error);
++        }
++    }
 +
 +    private static DoubleUnaryOperator loadAlsCorrection() {
 +        final String className = SystemProperties.get(
@@ -51,7 +108,11 @@ index b8b4758277b2..d8897522f81e 100644
                  // The time received from the sensor is in nano seconds, hence changing it to ms
                  final long time = TimeUnit.NANOSECONDS.toMillis(event.timestamp);
 -                final float lux = event.values[0];
-+                final float lux = (float) mAlsCorrection.applyAsDouble(event.values[0]);
-                 handleLightSensorEvent(time, lux);
+-                handleLightSensorEvent(time, lux);
++                final float rawLux = event.values[0];
++                if (!Float.isFinite(rawLux) || rawLux < 0f) {
++                    return;
++                }
++                handleLightSensorEvent(time, correctAmbientLux(rawLux));
              }
          }
