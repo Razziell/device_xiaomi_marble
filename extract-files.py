@@ -22,7 +22,7 @@ namespace_imports = [
     'hardware/google/interfaces',
     'hardware/google/pixel',
     'hardware/lineage/interfaces/power-libperfmgr',
-    'hardware/qcom-caf/common/libqti-perfd-client',
+    'device/xiaomi/marble/power',
     'hardware/xiaomi',
     'vendor/qcom/opensource/commonsys-intf/display',
     'vendor/xiaomi/sm8450-common',

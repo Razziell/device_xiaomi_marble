@@ -7,8 +7,41 @@
 # NFC
 TARGET_NFC_SUPPORTED_SKUS := marble
 
+# Select the device-owned Power HAL before inheriting the common product.
+TARGET_USES_DEVICE_POWERHAL := true
+# Select the local client namespace, independently of experimental activation.
+TARGET_USES_DEVICE_PERF_CLIENT := true
+
 # Inherit from xiaomi sm8450-common
 $(call inherit-product, device/xiaomi/sm8450-common/common.mk)
+
+# Experimental device-owned perf client, enabled for the requested integration.
+# Unknown requests fail instead of fabricating handles. Build/runtime validation
+# is still required; set both this selector and perf.enabled false to roll back.
+$(call soong_config_set,marble_power,perf_client,true)
+
+# Power: the common product omits its HAL and JSON when the device owns them.
+PRODUCT_SOONG_NAMESPACES += \
+    device/xiaomi/marble/power
+
+PRODUCT_PACKAGES += \
+    android.hardware.power-service.marble
+
+PRODUCT_COPY_FILES += \
+    device/xiaomi/marble/power/powerhint.json:$(TARGET_COPY_OUT_VENDOR)/etc/powerhint.json
+
+# Timer-only interaction backend. Initial tuning values, not measured optima.
+PRODUCT_VENDOR_PROPERTIES += \
+    vendor.powerhal.interaction.min=300 \
+    vendor.powerhal.interaction.max=1500 \
+    vendor.powerhal.interaction.offset=0 \
+    vendor.powerhal.perf.enabled=true
+
+# Device-tested Goodix (including screen-off) and CHI open/close; snapshot unverified.
+PRODUCT_VENDOR_PROPERTIES += \
+    vendor.powerhal.perf.goodix.enabled=true \
+    vendor.powerhal.perf.goodix.screenoff.enabled=true \
+    vendor.powerhal.perf.chi.enabled=true
 
 # Inherit from the proprietary version
 $(call inherit-product, vendor/xiaomi/marble/marble-vendor.mk)

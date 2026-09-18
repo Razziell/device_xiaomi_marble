@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Retain the established init service name for common init/client compatibility.
+service vendor.power-hal-aidl /vendor/bin/hw/android.hardware.power-service.marble
+    class hal
+    user root
+    group system
+    priority -20
+
+on late-fs
+    start vendor.power-hal-aidl
+
+on charger
+    start vendor.power-hal-aidl
+
+# Do not depend on vendor.powerhal.state having been created: LOW_POWER can
+# be used on a boot that never entered SUSTAINED_PERFORMANCE.
+on property:init.svc.zygote=restarting
+    stop vendor.power-hal-aidl
+    setprop vendor.powerhal.marble.requested v1:0
+    setprop vendor.powerhal.state ""
+    setprop vendor.powerhal.audio ""
+    setprop vendor.powerhal.rendering ""
+    setprop vendor.powerhal.marble.low_power 0
+    setprop vendor.powerhal.marble.flipendo 0
+    start vendor.power-hal-aidl
+
+# Preserve the common HAL's property forwarding for existing clients.
+on property:vendor.powerhal.dalvik.vm.dex2oat-threads=*
+    setprop dalvik.vm.dex2oat-threads ${vendor.powerhal.dalvik.vm.dex2oat-threads}
+    setprop dalvik.vm.restore-dex2oat-threads ${vendor.powerhal.dalvik.vm.dex2oat-threads}
+
+on property:vendor.powerhal.dalvik.vm.dex2oat-cpu-set=*
+    setprop dalvik.vm.dex2oat-cpu-set ${vendor.powerhal.dalvik.vm.dex2oat-cpu-set}
+    setprop dalvik.vm.restore-dex2oat-cpu-set ${vendor.powerhal.dalvik.vm.dex2oat-cpu-set}
+
+on property:ro.debuggable=1 && property:vendor.powerhal.config.debug=*
+    restart vendor.power-hal-aidl
+
+on property:persist.vendor.powerhal.config.debug=*
+    setprop vendor.powerhal.config.debug ${persist.vendor.powerhal.config.debug}

@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: Apache-2.0
+// Inherits the parent power namespace. Only this client namespace is exported
+// to Make for marble; other products keep the common hardware client.
+soong_config_module_type {
+    name: "marble_perf_client_defaults",
+    module_type: "cc_defaults",
+    config_namespace: "marble_power",
+    bool_variables: ["perf_client"],
+    properties: ["srcs", "shared_libs", "cpp_std"],
+}
+
+marble_perf_client_defaults {
+    name: "marble_perf_client_implementation",
+    soong_config_variables: {
+        perf_client: {
+            srcs: ["client.cpp", "PropertyClient.cpp"],
+            shared_libs: [
+                "marble-perf-ndk",
+                "libbase",
+                "libbinder_ndk",
+            ],
+            cpp_std: "c++20",
+            conditions_default: {
+                // Exact copy of the Lineage compatibility stub. Preserve old
+                // behavior until the experimental bridge is explicitly enabled.
+                srcs: ["client_stub.c"],
+            },
+        },
+    },
+}
+
+cc_library_shared {
+    name: "libqti-perfd-client",
+    defaults: ["marble_perf_client_implementation"],
+    // The product has arm64 and arm vendor consumers (including dlopen users).
+    compile_multilib: "both",
+    shared_libs: [
+        "liblog",
+        "libutils",
+    ],
+    cflags: [
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+    ],
+    vendor: true,
+}
+
+aidl_interface {
+    name: "marble-perf",
+    vendor_available: true,
+    unstable: true,
+    srcs: ["aidl/vendor/marble/power/*.aidl"],
+    local_include_dir: "aidl",
+    backend: {
+        java: { enabled: false },
+        cpp: { enabled: false },
+        ndk: { enabled: true },
+    },
+}

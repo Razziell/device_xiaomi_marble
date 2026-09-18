@@ -1,0 +1,51 @@
+// Copyright (C) 2021 The LineageOS Project
+// SPDX-License-Identifier: Apache-2.0
+
+soong_namespace {
+    imports: [
+        "hardware/google/interfaces",
+        "hardware/google/pixel",
+    ],
+}
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "android.hardware.power-service.marble",
+    vendor: true,
+    relative_install_path: "hw",
+    compile_multilib: "64",
+    init_rc: ["service.rc"],
+    vintf_fragments: ["service.xml"],
+    // Defense in depth; common.mk already excludes the old package for marble.
+    overrides: ["android.hardware.power-service.lineage-libperfmgr"],
+    shared_libs: [
+        "android.hardware.power-V6-ndk",
+        "pixel-power-ext-V1-ndk",
+        "libbase",
+        "libbinder_ndk",
+        "marble-perf-ndk",
+        "libcutils",
+        "liblog",
+        "libperfmgr",
+        "libprocessgroup",
+        "libutils",
+    ],
+    // HintManager.h -> NodeLooperThread.h -> FlagProvider.h includes the
+    // generated powerhal_flags.h even though this service does not run ADPF.
+    static_libs: [
+        "libaconfig_storage_read_api_cc",
+        "powerhal_flags-aconfig-cc",
+    ],
+    srcs: [
+        "service.cpp",
+        "Power.cpp",
+        "HintController.cpp",
+        "PerfLocks.cpp",
+        "PerfService.cpp",
+    ],
+    cpp_std: "c++20",
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+}

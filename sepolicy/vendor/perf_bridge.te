@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Private vendor camera/fingerprint->power interface. Only exact allowlisted
+# requests are accepted; Goodix has a separate default-OFF runtime gate.
+# No discovery/call grants to apps, shell, codecs or audio.
+type marble_perf_service, service_manager_type, hal_service_type, protected_service;
+add_service(hal_power_default, marble_perf_service)
+allow hal_camera_server marble_perf_service:service_manager find;
+binder_call(hal_camera_server, hal_power_default)
+binder_use(hal_camera_server)
+get_prop(hal_camera_server, vendor_power_prop)
+
+# Staged 500ms Goodix profile. Property gates do not replace SELinux: allow only
+# the existing fingerprint HAL server attribute, not all system-UID processes.
+allow hal_fingerprint_server marble_perf_service:service_manager find;
+binder_call(hal_fingerprint_server, hal_power_default)
+binder_use(hal_fingerprint_server)
+get_prop(hal_fingerprint_server, vendor_power_prop)
