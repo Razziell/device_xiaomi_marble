@@ -330,6 +330,11 @@
         <item>210</item>                           <!-- sensorRadius -->
     </array>
 
+    <!-- PocketService selects the wakeup sensor by string type, not display name.
+         Vendor pocket events report 0 when in pocket and 5 when outside. -->
+    <string name="config_pocketJudgeVendorSensorName" translatable="false">xiaomi.sensor.oem_pocket</string>
+    <item name="config_pocketJudgeVendorSensorValue" format="float" type="dimen">0.0</item>
+
     <!-- Whether device implements proximity sensor based checks to prevent
          accidental unlocks when the screen is off. -->
     <bool name="config_proximityCheckOnFpsUnlock">true</bool>
