@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <stdint.h>
 #include <sys/sysinfo.h>
 #include <libinit_utils.h>
 
@@ -16,7 +17,7 @@
 #define HEAPMAXFREE_PROP "dalvik.vm.heapmaxfree"
 #define HEAPTARGETUTILIZATION_PROP "dalvik.vm.heaptargetutilization"
 
-#define GB(b) (b * 1024ull * 1024 * 1024)
+static constexpr uint64_t kLowerRamCapacityBytes = 8ULL * 1024 * 1024 * 1024;
 
 static const dalvik_heap_info_t dalvik_heap_info_12288 = {
     .heapstartsize = "24m",
@@ -37,15 +38,17 @@ static const dalvik_heap_info_t dalvik_heap_info_8192 = {
 };
 
 void set_dalvik_heap() {
-    struct sysinfo sys;
-    const dalvik_heap_info_t *dhi;
+    struct sysinfo sys = {};
+    const dalvik_heap_info_t *dhi = &dalvik_heap_info_8192;
 
-    sysinfo(&sys);
-
-    if (sys.totalram > GB(11))
+    // Reserved memory reduces the usable total below the physical RAM capacity.
+    // More than 8 GiB usable RAM rules out the 8 GiB variant without requiring
+    // the 12 GiB variant to retain at least 11 GiB after reservations.
+    // Compare in sysinfo units to avoid overflowing a totalram * mem_unit product.
+    if (sysinfo(&sys) == 0 && sys.mem_unit != 0 &&
+        static_cast<uint64_t>(sys.totalram) > kLowerRamCapacityBytes / sys.mem_unit) {
         dhi = &dalvik_heap_info_12288;
-    else
-        dhi = &dalvik_heap_info_8192;
+    }
 
     property_override(HEAPSTARTSIZE_PROP, dhi->heapstartsize);
     property_override(HEAPGROWTHLIMIT_PROP, dhi->heapgrowthlimit);

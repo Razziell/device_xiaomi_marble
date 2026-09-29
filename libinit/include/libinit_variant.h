@@ -19,12 +19,11 @@ typedef struct variant_info {
     std::string marketname;
     std::string model;
     std::string mod_device;
-    std::string build_fingerprint;
 
 } variant_info_t;
 
-void search_variant(const std::vector<variant_info_t> variants);
+void search_variant(const std::vector<variant_info_t>& variants);
 
-void set_variant_props(const variant_info_t variant);
+void set_variant_props(const variant_info_t& variant);
 
 #endif // LIBINIT_VARIANT_H
