@@ -19,6 +19,7 @@ static const variant_info_t marble_global_info = {
     .marketname = "POCO F5",
     .model = "23049PCD8G",
     .mod_device = "marble_global",
+    .attestation_product = "marble_global",
 };
 
 static const variant_info_t marblein_info = {
@@ -29,8 +30,8 @@ static const variant_info_t marblein_info = {
     .device = "marblein",
     .marketname = "POCO F5",
     .model = "23049PCD8I",
-//  .mod_device = "marble_in_global",
     .mod_device = "marble_global", // Fixed miuicamera crash
+    .attestation_product = "marblein",
 };
 
 static const variant_info_t marble_info = {
@@ -41,8 +42,8 @@ static const variant_info_t marble_info = {
     .device = "marble",
     .marketname = "Redmi Note 12 Turbo",
     .model = "23049RAD8C",
-//  .mod_device = "marble",
     .mod_device = "marble_global", // Fixed miuicamera crash
+    .attestation_product = "marble",
 };
 
 static const std::vector<variant_info_t> variants = {

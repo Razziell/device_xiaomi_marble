@@ -35,6 +35,10 @@ void set_variant_props(const variant_info_t& variant) {
     set_ro_build_prop("marketname", variant.marketname, true);
     set_ro_build_prop("model", variant.model, true);
     set_ro_build_prop("mod_device", variant.mod_device, true);
+    // Keep KeyMint's product ID separate from ROM names and camera compatibility props.
+    if (!variant.attestation_product.empty()) {
+        property_override("ro.product.name_for_attestation", variant.attestation_product, true);
+    }
     property_override("vendor.usb.product_string", variant.marketname, true);
     if (access("/system/bin/recovery", F_OK) != 0) {
         property_override("bluetooth.device.default_name", variant.marketname, true);
