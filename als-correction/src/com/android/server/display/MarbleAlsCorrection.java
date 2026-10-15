@@ -136,6 +136,9 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     /** Downscaled capture edge, in pixels. 16x16 = 256 samples, plenty for an average. */
     private static final int SAMPLE_EDGE = 16;
 
+    /** Precomputed circular sensor mask for the 16x16 sample grid (excludes corner pixels). */
+    private static final boolean[] DISC_MASK = createDiscMask();
+
     /** Delay after a completed capture; independent of on-change ALS event delivery. */
     private static final long DEFAULT_CAPTURE_INTERVAL_MS = 500;
 
@@ -170,6 +173,9 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     private long mLastCaptureDurationMs = -1;
     private long mLastLumaElapsed = -1;
     private float mLastLumaNorm = -1f;
+    private float mLastRedNorm = -1f;
+    private float mLastGreenNorm = -1f;
+    private float mLastBlueNorm = -1f;
     private boolean mCapturePending;
     private boolean mRefreshScheduled;
     private boolean mLightSensorEnabled;
@@ -190,6 +196,14 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     private long mLastUsedCacheAgeMs = -1;
     // Only accessed on the ALS callback looper. Retry sysfs until a valid maximum is available.
     private float mMaxBacklight = -1f;
+    private final byte[] mAlsSysfsBuf = new byte[16];
+    // Only accessed on the capture worker thread.
+    private final byte[] mWorkerSysfsBuf = new byte[16];
+    private final int[] mPixelBuffer = new int[SAMPLE_EDGE * SAMPLE_EDGE];
+    private final float[] mRgbScratch = new float[3];
+    private final float[] mGammaLut = new float[256];
+    private float mCachedGamma = Float.NaN;
+    private IBinder mDisplayToken;
     private boolean mCaptureFailedLogged;
     private String mRequestedState;
     private final Runnable mRefreshContent = this::updateContentLuma;
@@ -202,7 +216,26 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
         setStateProp(state);
     };
 
-    public MarbleAlsCorrection() {}
+    public MarbleAlsCorrection() {
+        SystemProperties.addChangeCallback(this::onSyspropChanged);
+    }
+
+    private void onSyspropChanged() {
+        synchronized (mLock) {
+            if (!mLightSensorEnabled) {
+                return;
+            }
+            if (!isCorrectionEnabled()) {
+                CAPTURE_HANDLER.removeCallbacks(mRefreshContent);
+                mRefreshScheduled = false;
+                invalidateContentLumaLocked();
+                publishStateLocked(STATE_OFF);
+            } else if (!mCapturePending && !mRefreshScheduled) {
+                publishStateLocked(STATE_PENDING);
+                scheduleRefreshLocked(0);
+            }
+        }
+    }
 
     /** Optional framework hook: notify us before enabling/disabling the ALS listener. */
     @Override
@@ -219,11 +252,13 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             CAPTURE_HANDLER.removeCallbacks(mRefreshContent);
             mRefreshScheduled = false;
             invalidateContentLumaLocked();
-            publishStateLocked(!isCorrectionEnabled() ? STATE_OFF
+            final boolean correctionEnabled = isCorrectionEnabled();
+            publishStateLocked(!correctionEnabled ? STATE_OFF
                     : mLightSensorEnabled ? STATE_PENDING : STATE_IDLE);
-            // Prewarm before the first ALS event. A running old generation will arrange the
-            // new refresh when it finishes; never queue parallel or duplicate captures.
-            scheduleRefreshLocked(0);
+            // Prewarm before the first ALS event only when correction is enabled.
+            if (correctionEnabled) {
+                scheduleRefreshLocked(0);
+            }
         }
     }
 
@@ -275,7 +310,24 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             return rawLux;
         }
 
-        final float lumaNorm = getFreshContentLuma();
+        final float rNorm;
+        final float gNorm;
+        final float bNorm;
+        final float lumaNorm;
+        synchronized (mLock) {
+            final long now = SystemClock.elapsedRealtime();
+            expireContentLocked(now);
+            lumaNorm = mLastLumaNorm;
+            rNorm = mLastRedNorm;
+            gNorm = mLastGreenNorm;
+            bNorm = mLastBlueNorm;
+            if (lumaNorm >= 0f) {
+                mLastUsedCacheAgeMs = now - mLastLumaElapsed;
+            } else if (!mCapturePending && !mRefreshScheduled) {
+                // Recover if enabled via adb setprop without reportSyspropChanged().
+                scheduleRefreshLocked(0);
+            }
+        }
         if (lumaNorm < 0f) {
             // No fresh sample: pass through until a background capture succeeds.
             // This is not necessarily a capture failure.
@@ -288,26 +340,23 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 getFloatProp("persist.sys.als_correction.ref_luma", DEF_REFERENCE_LUMA),
                 REF_LUMA_MIN, REF_LUMA_MAX);
 
-        final float leakage = k * Math.max(0f, lumaNorm - referenceLuma) * dbvNorm;
+        // Apply the dark-UI baseline per primary before spectral weighting. For neutral gray/white
+        // (R = G = B) this is algebraically identical to max(0, lumaNorm - referenceLuma) because
+        // the weights sum to 1, while allowing saturated blue and red content to be compensated.
+        final float effR = Math.max(0f, rNorm - referenceLuma);
+        final float effG = Math.max(0f, gNorm - referenceLuma);
+        final float effB = Math.max(0f, bNorm - referenceLuma);
+        final float excessContent = (float) (RED_WEIGHT * effR
+                + GREEN_WEIGHT * effG
+                + BLUE_WEIGHT * effB);
+        final float leakage = k * excessContent * dbvNorm;
         final float corrected = Math.max(0f, rawLux - leakage);
 
         if (DEBUG) {
-            Slog.d(TAG, "raw=" + rawLux + " luma=" + lumaNorm + " dbv=" + dbvNorm
-                    + " leak=" + leakage + " -> " + corrected);
+            Slog.d(TAG, "raw=" + rawLux + " luma=" + lumaNorm + " excess=" + excessContent
+                    + " dbv=" + dbvNorm + " leak=" + leakage + " -> " + corrected);
         }
         return Float.isFinite(corrected) ? corrected : rawLux;
-    }
-
-    /** Read-only cache consumption: ALS callbacks never schedule or wait for a capture. */
-    private float getFreshContentLuma() {
-        synchronized (mLock) {
-            final long now = SystemClock.elapsedRealtime();
-            expireContentLocked(now);
-            if (mLastLumaNorm >= 0f) {
-                mLastUsedCacheAgeMs = now - mLastLumaElapsed;
-            }
-            return mLastLumaNorm;
-        }
     }
 
     private static long getCaptureIntervalMs() {
@@ -340,22 +389,28 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
 
         final long captureStarted = SystemClock.elapsedRealtime();
         float luma = -1f;
+        float rNorm = -1f;
+        float gNorm = -1f;
+        float bNorm = -1f;
         boolean attempted = false;
         String unavailableState = STATE_PENDING;
         try {
             // Skip expensive work when disabled, screen OFF/dozing, or DBV is unreadable.
-            unavailableState = getUnavailableState();
+            unavailableState = getUnavailableState(mWorkerSysfsBuf);
             if (unavailableState == null) {
                 attempted = true;
                 final Bitmap bitmap = captureSensorRegion();
                 if (bitmap != null) {
                     try {
-                        luma = averageLuma(bitmap);
+                        luma = averageRgb(bitmap, mRgbScratch);
+                        rNorm = mRgbScratch[0];
+                        gNorm = mRgbScratch[1];
+                        bNorm = mRgbScratch[2];
                     } finally {
                         bitmap.recycle();
                     }
                 }
-                unavailableState = getUnavailableState();
+                unavailableState = getUnavailableState(mWorkerSysfsBuf);
             }
         } catch (RuntimeException | LinkageError e) {
             logCaptureFailure(e);
@@ -372,12 +427,14 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 }
                 final boolean accepted = generation == mCaptureGeneration && mLightSensorEnabled;
                 long nextDelayMs = Math.max(getCaptureIntervalMs(), RETRY_INTERVAL_MS);
+                boolean shouldSchedule = true;
                 if (!accepted) {
                     if (attempted) {
                         mDiscardedCaptures++;
                     }
                     // A disable/enable cycle during capture needs a new-generation prewarm.
                     nextDelayMs = 0;
+                    shouldSchedule = mLightSensorEnabled && isCorrectionEnabled();
                 } else {
                     clearContentLumaLocked();
                     if (unavailableState != null) {
@@ -389,6 +446,10 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                             }
                         }
                         publishStateLocked(unavailableState);
+                        if (STATE_OFF.equals(unavailableState)) {
+                            // Stop background wakeups completely when correction is disabled.
+                            shouldSchedule = false;
+                        }
                     } else if (!Float.isFinite(luma) || luma < 0f) {
                         mCaptureFailures++;
                         publishStateLocked(STATE_CAPTURE_FAILED);
@@ -397,6 +458,9 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                         publishStateLocked(STATE_PENDING);
                     } else {
                         mLastLumaNorm = luma;
+                        mLastRedNorm = rNorm;
+                        mLastGreenNorm = gNorm;
+                        mLastBlueNorm = bNorm;
                         mLastLumaElapsed = captureStarted;
                         mCaptureSuccesses++;
                         mCaptureFailedLogged = false;
@@ -406,15 +470,15 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                         nextDelayMs = getCaptureIntervalMs();
                     }
                 }
-                // Disabled correction polls only its property; disabled ALS stops all work.
-                // This also recovers after a live property change without needing an ALS event.
-                scheduleRefreshLocked(nextDelayMs);
+                if (shouldSchedule) {
+                    scheduleRefreshLocked(nextDelayMs);
+                }
             }
         }
     }
 
     /** null means capture is usable; an empty state means display/DBV information is unavailable. */
-    private static String getUnavailableState() {
+    private static String getUnavailableState(byte[] sysfsBuf) {
         if (!isCorrectionEnabled()) {
             return STATE_OFF;
         }
@@ -425,7 +489,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
         if (info.state != Display.STATE_ON) {
             return STATE_IDLE;
         }
-        final float dbv = readSysfsFloat(BACKLIGHT_PATH);
+        final float dbv = readSysfsFloat(BACKLIGHT_PATH, sysfsBuf);
         return dbv < 0f ? STATE_PENDING : dbv == 0f ? STATE_IDLE : null;
     }
 
@@ -451,6 +515,9 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
 
     private void clearContentLumaLocked() {
         mLastLumaNorm = -1f;
+        mLastRedNorm = -1f;
+        mLastGreenNorm = -1f;
+        mLastBlueNorm = -1f;
         mLastLumaElapsed = -1;
         STATE_HANDLER.removeCallbacks(mExpireContent);
     }
@@ -494,13 +561,17 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
 
             final float scale = (float) SAMPLE_EDGE / Math.max(crop.width(), crop.height());
 
-            final long[] ids = DisplayControl.getPhysicalDisplayIds();
-            if (ids == null || ids.length == 0) {
-                return null;
-            }
-            final IBinder token = DisplayControl.getPhysicalDisplayToken(ids[0]);
+            IBinder token = mDisplayToken;
             if (token == null) {
-                return null;
+                final long[] ids = DisplayControl.getPhysicalDisplayIds();
+                if (ids == null || ids.length == 0) {
+                    return null;
+                }
+                token = DisplayControl.getPhysicalDisplayToken(ids[0]);
+                if (token == null) {
+                    return null;
+                }
+                mDisplayToken = token;
             }
 
             final ScreenCaptureInternal.DisplayCaptureArgs args =
@@ -518,6 +589,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             final ScreenCaptureInternal.ScreenshotHardwareBuffer buffer =
                     ScreenCaptureInternal.captureDisplay(args);
             if (buffer == null) {
+                mDisplayToken = null;
                 return null;
             }
 
@@ -542,6 +614,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 }
             }
         } catch (RuntimeException | LinkageError e) {
+            mDisplayToken = null;
             logCaptureFailure(e);
             return null;
         }
@@ -554,58 +627,142 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
         }
     }
 
-    /** Average TCS3701-weighted panel emission, linearized per RGB channel. */
-    private static float averageLuma(Bitmap bitmap) {
+    private static boolean[] createDiscMask() {
+        final boolean[] mask = new boolean[SAMPLE_EDGE * SAMPLE_EDGE];
+        final float center = SAMPLE_EDGE * 0.5f;
+        final float radiusSq = center * center;
+        for (int y = 0; y < SAMPLE_EDGE; y++) {
+            final float dy = (y + 0.5f) - center;
+            for (int x = 0; x < SAMPLE_EDGE; x++) {
+                final float dx = (x + 0.5f) - center;
+                mask[y * SAMPLE_EDGE + x] = (dx * dx + dy * dy) <= radiusSq;
+            }
+        }
+        return mask;
+    }
+
+    private float[] getGammaLut(float gamma) {
+        if (gamma != mCachedGamma) {
+            mGammaLut[0] = 0f;
+            for (int i = 1; i < 255; i++) {
+                mGammaLut[i] = (float) Math.pow(i / 255.0, gamma);
+            }
+            mGammaLut[255] = 1f;
+            mCachedGamma = gamma;
+        }
+        return mGammaLut;
+    }
+
+    /**
+     * Computes average linearized R, G, B emission inside the sensor disc and returns the
+     * TCS3701-weighted total. Runs only on the capture worker thread.
+     */
+    private float averageRgb(Bitmap bitmap, float[] outRgb) {
         final int w = bitmap.getWidth();
         final int h = bitmap.getHeight();
         if (w <= 0 || h <= 0) {
+            outRgb[0] = 0f;
+            outRgb[1] = 0f;
+            outRgb[2] = 0f;
             return 0f;
         }
-        final int[] pixels = new int[w * h];
+        final int count = w * h;
+        final int[] pixels = count <= mPixelBuffer.length ? mPixelBuffer : new int[count];
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h);
 
         final float gamma = clamp(
                 getFloatProp("persist.sys.als_correction.gamma", DEF_GAMMA),
                 GAMMA_MIN, GAMMA_MAX);
+        final float[] lut = getGammaLut(gamma);
+        final boolean useStaticMask = (w == SAMPLE_EDGE && h == SAMPLE_EDGE);
 
-        double sum = 0;
-        for (int px : pixels) {
-            final double r = ((px >> 16) & 0xFF) / 255.0;
-            final double g = ((px >> 8) & 0xFF) / 255.0;
-            final double b = (px & 0xFF) / 255.0;
+        double sumR = 0;
+        double sumG = 0;
+        double sumB = 0;
+        int samples = 0;
 
-            // Linearize each OLED primary independently, then apply the measured spectral response
-            // of the under-display ALS. Rec.709 weights describe human vision and under-corrected
-            // blue while over-correcting red on the measured marble panel.
-            sum += RED_WEIGHT * Math.pow(r, gamma)
-                    + GREEN_WEIGHT * Math.pow(g, gamma)
-                    + BLUE_WEIGHT * Math.pow(b, gamma);
+        if (useStaticMask) {
+            for (int i = 0; i < count; i++) {
+                if (!DISC_MASK[i]) {
+                    continue;
+                }
+                final int px = pixels[i];
+                sumR += lut[(px >> 16) & 0xFF];
+                sumG += lut[(px >> 8) & 0xFF];
+                sumB += lut[px & 0xFF];
+                samples++;
+            }
+        } else {
+            final float invW = 1f / w;
+            final float invH = 1f / h;
+            for (int y = 0; y < h; y++) {
+                final float dy = (y + 0.5f) * invH - 0.5f;
+                for (int x = 0; x < w; x++) {
+                    final float dx = (x + 0.5f) * invW - 0.5f;
+                    if (dx * dx + dy * dy > 0.25f) {
+                        continue;
+                    }
+                    final int px = pixels[y * w + x];
+                    sumR += lut[(px >> 16) & 0xFF];
+                    sumG += lut[(px >> 8) & 0xFF];
+                    sumB += lut[px & 0xFF];
+                    samples++;
+                }
+            }
         }
-        return (float) (sum / pixels.length);
+
+        if (samples == 0) {
+            outRgb[0] = 0f;
+            outRgb[1] = 0f;
+            outRgb[2] = 0f;
+            return 0f;
+        }
+        final float meanR = (float) (sumR / samples);
+        final float meanG = (float) (sumG / samples);
+        final float meanB = (float) (sumB / samples);
+        outRgb[0] = meanR;
+        outRgb[1] = meanG;
+        outRgb[2] = meanB;
+        return (float) (RED_WEIGHT * meanR + GREEN_WEIGHT * meanG + BLUE_WEIGHT * meanB);
     }
 
     /** Current panel DBV normalized to 0..1, or -1 if it cannot be read reliably. */
     private float getBacklightNorm() {
-        final float cur = readSysfsFloat(BACKLIGHT_PATH);
+        final float cur = readSysfsFloat(BACKLIGHT_PATH, mAlsSysfsBuf);
         if (cur <= 0f) {
             return cur;
         }
         if (mMaxBacklight <= 0f) {
-            mMaxBacklight = readSysfsFloat(MAX_BACKLIGHT_PATH);
+            mMaxBacklight = readSysfsFloat(MAX_BACKLIGHT_PATH, mAlsSysfsBuf);
         }
         return mMaxBacklight > 0f ? Math.min(1f, cur / mMaxBacklight) : -1f;
     }
 
-    private static float readSysfsFloat(String path) {
+    private static float readSysfsFloat(String path, byte[] buf) {
         try (FileInputStream is = new FileInputStream(path)) {
-            final byte[] buf = new byte[16];
             final int n = is.read(buf);
             if (n <= 0) {
                 return -1f;
             }
-            final float value = Float.parseFloat(
-                    new String(buf, 0, n, StandardCharsets.UTF_8).trim());
-            return Float.isFinite(value) && value >= 0f ? value : -1f;
+            int value = 0;
+            boolean hasDigits = false;
+            for (int i = 0; i < n; i++) {
+                final byte b = buf[i];
+                if (b >= '0' && b <= '9') {
+                    value = value * 10 + (b - '0');
+                    hasDigits = true;
+                } else if (b == ' ' || b == '\n' || b == '\r' || b == '\t') {
+                    if (hasDigits) {
+                        break;
+                    }
+                } else {
+                    // Fallback for non-integer formatting.
+                    final float parsed = Float.parseFloat(
+                            new String(buf, 0, n, StandardCharsets.UTF_8).trim());
+                    return Float.isFinite(parsed) && parsed >= 0f ? parsed : -1f;
+                }
+            }
+            return hasDigits ? (float) value : -1f;
         } catch (Exception e) {
             return -1f;
         }

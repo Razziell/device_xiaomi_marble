@@ -175,18 +175,22 @@ They sum to 1, so the existing white/gray calibration and the user-facing `k` co
 preserved. Compared with Rec.709 human-vision weights, this reduces red over-correction and
 increases blue correction without changing the number or frequency of screen captures.
 
-The model remains deliberately conservative: with the default `ref_luma=0.14`, a pure blue
-sample (`contentLevel=0.0956`) is below the subtraction threshold. These weights do not by
-themselves guarantee complete cancellation for every color. Changing this baseline or using
-a circular/spatially weighted sample requires a separate calibration.
+The dark-UI baseline (`ref_luma`) is subtracted per linearized primary before spectral
+weighting, and only pixels inside the inscribed circular sensor disc of the `16 x 16` sample
+grid are averaged (using a cached 256-entry gamma LUT). Because the RGB weights sum to 1,
+neutral white/gray content and dark UIs where all primaries are below `ref_luma` behave
+identically to a post-sum threshold, while saturated blue (`#0000FF`) and red (`#FF0000`)
+content above the sensor are compensated proportionally to their measured TCS3701 response.
 
 The correction formula is approximately:
 
 ```text
-linearR/G/B = pow(capturedR/G/B / 255, gamma)
-contentLevel = 0.1810 * linearR + 0.7234 * linearG + 0.0956 * linearB
+meanR/G/B = discMean(pow(capturedR/G/B / 255, gamma))
+excessContent = 0.1810 * max(0, meanR - refLuma)
+    + 0.7234 * max(0, meanG - refLuma)
+    + 0.0956 * max(0, meanB - refLuma)
 correctedLux = max(0, rawLux
-    - k * max(0, contentLevel - refLuma) * currentDbv / maximumDbv)
+    - k * excessContent * currentDbv / maximumDbv)
 ```
 
 ## Capture safety
@@ -222,9 +226,10 @@ bursts, or queue growth if SurfaceFlinger is slow. Captures only update the cont
 they never inject synthetic sensor events, reuse old lux, or force brightness updates.
 The next real ALS event consumes the latest fresh content with the current DBV.
 
-Disabled correction, OFF/doze, unavailable DBV and capture failures use a retry delay of
-`max(interval_ms, 1000)` ms. Disabled correction checks only its enable property (no display,
-sysfs or capture work). This allows live re-enabling to recover even with no TYPE_LIGHT event.
+OFF/doze, unavailable DBV and capture failures use a retry delay of
+`max(interval_ms, 1000)` ms. Disabled correction (`enabled=false`) stops the background
+refresh timer completely (zero periodic wakeups) and resumes immediately on a sysprop change
+notification from XiaomiParts or on the next ALS event.
 When the ALS listener is disabled, **all queued refreshes are cancelled**: no polling,
 capture or wake lock is kept for an inactive listener. An already running capture cannot
 be cancelled, but its old-generation result is discarded. Re-enabling during that capture
@@ -259,8 +264,7 @@ At defaults:
 * only a roughly `94 x 94` source region is requested and downscaled to `16 x 16`;
 * new capture requests run only while the ALS listener is enabled; an already running capture
   may finish after disable, but its result is discarded;
-* a disabled correction bypasses DBV reads and captures; while ALS is enabled it retains
-  only a low-rate property check to notice live re-enabling;
+* a disabled correction bypasses DBV reads and stops background capture wakeups completely;
 * capture failure or secure/unavailable content safely falls back to unmodified lux.
 
 Periodic sampling intentionally performs more captures under stable light than the old
