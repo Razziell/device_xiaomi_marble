@@ -49,3 +49,17 @@ cc_binary {
     cpp_std: "c++20",
     cflags: ["-Wall", "-Wextra", "-Werror"],
 }
+
+// Pure policy and POSIX dump-writer tests; no sysfs or device Binder calls.
+cc_test_host {
+    name: "marble-power-policy-tests",
+    srcs: [
+        "HintController.cpp",
+        "PerfLocks.cpp",
+        "tests/PolicyTest.cpp",
+        "tests/DumpWriterTest.cpp",
+    ],
+    local_include_dirs: ["."],
+    cpp_std: "c++20",
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+}

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "HintController.h"
+#include "InteractionPolicy.h"
 
 #include <algorithm>
 #include <array>
@@ -46,7 +47,9 @@ bool HintController::restoreModes() {
     // mGoodixScreenOffUsed stays true: a HAL restart is not a new off epoch.
     // The complete set is installed before any enqueue, so masked floors are
     // not briefly applied while restoring saver/noninteractive state.
-    return reconcileLocked();
+    const bool reconciled = reconcileLocked();
+    noteModeFailureLocked(reconciled);
+    return reconciled;
 }
 
 bool HintController::saveModesLocked() {
@@ -86,8 +89,7 @@ bool HintController::wantedLocked(const std::string& name) const {
     }
     if (name == "SUSTAINED_PERFORMANCE") return !saver;
     if (name == "EXPENSIVE_RENDERING") {
-        return !mRequested.contains("Flipendo") &&
-               (!mInteractiveKnown || mRequested.contains("INTERACTIVE"));
+        return !saver && (!mInteractiveKnown || mRequested.contains("INTERACTIVE"));
     }
     return true;
 }
@@ -135,6 +137,17 @@ bool HintController::reconcileLocked() {
     return ok;
 }
 
+void HintController::noteModeFailureLocked(bool reconciled) {
+    if (reconciled) {
+        mModeRetryPending = 0;
+        return;
+    }
+    ++mModeReconcileFailures;
+    mModeRetryPending = 8;
+    startTimerLocked();
+    mPerfCv.notify_all();
+}
+
 bool HintController::setMode(const std::string& name, bool enabled) {
     if (!supportsMode(name)) return false;
     std::lock_guard lock(mMutex);
@@ -165,13 +178,19 @@ bool HintController::setMode(const std::string& name, bool enabled) {
         !cancelGoodixScreenOffLocked()) return false;
     // Conservatively keep the existing cancellation on any blocking mode call,
     // including duplicate screen-off. Cancellation does not refund the budget.
-    if (boostsBlockedLocked() && !cancelTransientLocked()) return false;
-    return reconcileLocked() && saved;
+    if (boostsBlockedLocked() && !cancelTransientLocked()) {
+        noteModeFailureLocked(false);
+        return false;
+    }
+    const bool reconciled = reconcileLocked();
+    noteModeFailureLocked(reconciled);
+    return reconciled && saved;
 }
 
 bool HintController::setBoost(const std::string& name, int32_t durationMs) {
     if (!supportsBoost(name)) return false;
     std::lock_guard lock(mMutex);
+    if (mModeRetryPending > 0 && reconcileLocked()) mModeRetryPending = 0;
     if (durationMs < 0) {
         const bool ok = mBackend.end(name);
         if (ok) mInteractionDeadline = {};
@@ -179,12 +198,17 @@ bool HintController::setBoost(const std::string& name, int32_t durationMs) {
     }
     if (boostsBlockedLocked()) return true;
     const auto duration = std::chrono::milliseconds(interactionDurationMs(durationMs, mConfig));
-    const auto deadline = std::chrono::steady_clock::now() + duration;
-    // RequestGroup extends (never shortens) the same hint. Avoid enqueueing a
-    // shorter request already covered by the current one. Capture the deadline
-    // before enqueue so this estimate cannot outlive the backend's actual timer.
-    if (deadline <= mInteractionDeadline) return true;
+    const auto now = std::chrono::steady_clock::now();
+    const auto deadline = now + duration;
+    // Keep the deadline of the last actual enqueue, not skipped extensions.
+    // The omitted tail is <25ms; cancellation and near-expiry requests bypass
+    // this coalescing. Enqueue timestamps are captured conservatively.
+    if (!shouldEnqueueInteraction(now, mInteractionDeadline, deadline)) {
+        ++mInteractionCoalesced;
+        return true;
+    }
     if (!mBackend.startFor(name, duration)) return false;
+    ++mInteractionEnqueued;
     mInteractionDeadline = deadline;
     return true;
 }
@@ -201,7 +225,11 @@ std::string HintController::dump() const {
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             mInteractionDeadline - std::chrono::steady_clock::now()).count();
     out << "\nInteraction requested remaining ms: " << std::max<int64_t>(0, remaining)
+        << "\nInteraction enqueued/coalesced: " << mInteractionEnqueued
+        << '/' << mInteractionCoalesced
         << "\nRequested-mode save failures: " << mModeSaveFailures
+        << "\nMode reconcile failures/pending retries: " << mModeReconcileFailures
+        << '/' << mModeRetryPending
         << "\nBoosts blocked: " << boostsBlockedLocked()
         << "\nPerf owners/locks: " << mPerfOwners.size() << '/' << mPerfLocks.size()
         << "\nPerf accepted/rejected: " << mPerfAccepted << '/' << mPerfRejected

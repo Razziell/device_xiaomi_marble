@@ -64,6 +64,8 @@ class HintController {
   private:
     bool saveModesLocked();
     bool reconcileLocked();
+    void noteModeFailureLocked(bool reconciled);
+    void startTimerLocked();
     bool cancelTransientLocked();
     bool boostsBlockedLocked() const;
     bool wantedLocked(const std::string& name) const;
@@ -80,11 +82,15 @@ class HintController {
     RequestedModeStore* const mModeStore;
     std::string mSavedModes;
     uint64_t mModeSaveFailures = 0;
+    uint64_t mModeReconcileFailures = 0;
+    unsigned mModeRetryPending = 0;
     mutable std::mutex mMutex;
     std::set<std::string> mRequested;
     std::set<std::string> mApplied;
     bool mInteractiveKnown = false;
     std::chrono::steady_clock::time_point mInteractionDeadline{};
+    uint64_t mInteractionEnqueued = 0;
+    uint64_t mInteractionCoalesced = 0;
 
     struct PerfLock {
         uint64_t owner;

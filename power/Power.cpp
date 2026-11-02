@@ -3,10 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "Power.h"
+#include "DumpWriter.h"
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <perfmgr/HintManager.h>
+#include <cstring>
 #include <utility>
 
 namespace marble::power {
@@ -106,12 +108,24 @@ ndk::ScopedAStatus Power::sendCompositionUpdate(const hal::CompositionUpdate&) {
     return unsupported();
 }
 
-binder_status_t Power::dump(int fd, const char**, uint32_t) {
+binder_status_t Power::dump(int fd, const char** args, uint32_t numArgs) {
+    bool rawBackend = false;
+    for (uint32_t i = 0; i < numArgs && args != nullptr; ++i) {
+        if (args[i] != nullptr && std::strcmp(args[i], "--raw-backend") == 0) {
+            rawBackend = true;
+        }
+    }
     const auto* hm = ::android::perfmgr::HintManager::GetInstance();
     const std::string text = mController->dump() +
-            "HintManager Running: " + (hm->IsRunning() ? "true\n" : "false\n");
-    if (!::android::base::WriteStringToFd(text, fd)) return STATUS_FAILED_TRANSACTION;
-    ::android::perfmgr::HintManager::GetInstance()->DumpToFd(fd);
+            "HintManager Running: " + (hm->IsRunning() ? "true\n" : "false\n") +
+            (rawBackend ? "" : "Backend node/queue dump: omitted (--raw-backend)\n");
+    const bool written = rawBackend ? ::android::base::WriteStringToFd(text, fd)
+                                    : writeBoundedDump(fd, text);
+    if (!written) return STATUS_FAILED_TRANSACTION;
+    // HintManager::DumpToFd reads sysfs and writes the output pipe while
+    // holding the node worker and job queue locks. Keep normal dumpsys
+    // lock-safe; run the deep backend dump only on explicit request.
+    if (rawBackend) ::android::perfmgr::HintManager::GetInstance()->DumpToFd(fd);
     return STATUS_OK;
 }
 

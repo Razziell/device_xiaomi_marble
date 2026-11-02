@@ -192,7 +192,7 @@ int HintController::acquirePerfLocked(uint64_t owner, int handle, int durationMs
     // Xiaomi: zero -> 2s, cap 5s. Goodix: default/cap 500ms. CHI: 1..2000ms.
     const int bounded = boundedPerfDuration(durationMs, profile);
     if (screenOff) mGoodixScreenOffUsed = true;
-    if (!mPerfThread.joinable()) mPerfThread = std::thread(&HintController::runPerfTimer, this);
+    startTimerLocked();
     mPerfLocks.insert_or_assign(handle, PerfLock{owner, profile, Clock::now() + Ms(bounded)});
     if (!reconcilePerfLocked()) {
         // Roll back a CHI replacement to its old deadline (never extend it).
@@ -227,13 +227,24 @@ void HintController::closePerfOwner(uint64_t owner) {
     mPerfCv.notify_all();
 }
 
+void HintController::startTimerLocked() {
+    if (!mPerfThread.joinable()) mPerfThread = std::thread(&HintController::runPerfTimer, this);
+}
+
 void HintController::runPerfTimer() {
     std::unique_lock lock(mMutex);
     while (!mPerfStop) {
+        if (mModeRetryPending > 0) {
+            if (reconcileLocked()) {
+                mModeRetryPending = 0;
+            } else {
+                --mModeRetryPending;
+            }
+        }
         const bool ok = reconcilePerfLocked();
-        if (!ok) {
-            // Cancellation retries are bounded in rate, while payload votes
-            // have their own libperfmgr timeout as a fail-safe.
+        if (!ok || mModeRetryPending > 0) {
+            // Cancellation and persistent-mode retries are bounded in rate,
+            // while payload votes have their own libperfmgr timeout as a fail-safe.
             mPerfCv.wait_for(lock, Ms(100));
         } else if (mPerfLocks.empty()) {
             mPerfCv.wait(lock);

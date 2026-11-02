@@ -9,7 +9,13 @@ struct ClientLease {
     int remote;
     std::chrono::steady_clock::time_point deadline;
     bool goodix;
+    // An EAGAIN renewal may be retried with this alias. If the caller instead
+    // opens a fresh Goodix lease after expiry, the rejected alias is reclaimable.
+    bool renewalRejected = false;
 
+    bool reclaimOnFreshGoodix(std::chrono::steady_clock::time_point now) const {
+        return goodix && renewalRejected && expired(now);
+    }
     bool expired(std::chrono::steady_clock::time_point now) const { return deadline <= now; }
     bool retain(std::chrono::steady_clock::time_point now) const { return goodix || !expired(now); }
     int remoteForUpdate(std::chrono::steady_clock::time_point now) const {

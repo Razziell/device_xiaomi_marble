@@ -88,6 +88,14 @@ int perf_lock_acq(int handle, int duration, int resources[], int count) {
         if (!it->second.accepts(goodix)) return failure(EINVAL);
         remoteHandle = it->second.remoteForUpdate(now);
     } else {
+        if (goodix) {
+            // Reclaim only expired aliases with rejected renewals when the
+            // caller opens a fresh Goodix lease. Do not evict live votes,
+            // normal retained aliases, camera leases or CHI tombstones.
+            std::erase_if(c.handles, [&](const auto& entry) {
+                return entry.second.reclaimOnFreshGoodix(now);
+            });
+        }
         // Retained Goodix aliases have no live vote after expiry. Reclaim them
         // under capacity pressure rather than allowing unbounded alias growth.
         if (c.handles.size() + c.chiHandles.size() >= 16) {
@@ -116,6 +124,8 @@ int perf_lock_acq(int handle, int duration, int resources[], int count) {
         }
         if (handle > 0 && result != -EAGAIN) {
             c.handles.erase(handle);
+        } else if (handle > 0 && goodix && result == -EAGAIN) {
+            c.handles.at(handle).renewalRejected = true;
         }
         return failure(result < 0 ? -result : EIO);
     }
