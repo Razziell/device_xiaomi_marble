@@ -89,7 +89,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     // Measured on the connected marble across DBV 250/500/1000/2000:
     // delta(white-black) = 21.96/43.63/88.41/184.61 lux. Together with the measured
     // framebuffer delta-luma=0.5763 this gives k=625..656; use the rounded mean.
-    private static final int DEF_K = 650;
+    private static final int DEF_K = 550;
 
     // Settings in dark mode is not pixel-black around the sensor because of status-bar icons.
     // Using that content as the baseline preserves the vendor algorithm's dark-content output

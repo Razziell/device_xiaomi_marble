@@ -71,7 +71,7 @@ is still enabled, a lightweight worker check detects re-enabling without needing
 | Property | Default | Clamped to | Meaning |
 |---|---:|---:|---|
 | `persist.sys.als_correction.enabled` | `true` | — | Enables or bypasses correction. |
-| `persist.sys.als_correction.k` | `650` | `0..1500` | Leakage in lux for a fully lit weighted RGB sample at maximum DBV. Larger values apply stronger correction. |
+| `persist.sys.als_correction.k` | `550` | `0..1500` | Leakage in lux for a fully lit weighted RGB sample at maximum DBV. Larger values apply stronger correction. |
 | `persist.sys.als_correction.ref_luma` | `0.14` | `0..1` | Weighted content level below which no leakage is subtracted. |
 | `persist.sys.als_correction.gamma` | `2.2` | `1..4` | Gamma used to convert each captured RGB primary to approximate panel emission. |
 | `persist.sys.als_correction.cx` | `745` | `0..1079` | Sensor-area center X in natural panel coordinates. |
