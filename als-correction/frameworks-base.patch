@@ -1,25 +1,209 @@
-diff --git a/services/core/java/com/android/server/display/AutomaticBrightnessController.java b/services/core/java/com/android/server/display/AutomaticBrightnessController.java
-index b8b4758277b2..c70d80013e58 100644
---- a/services/core/java/com/android/server/display/AutomaticBrightnessController.java
-+++ b/services/core/java/com/android/server/display/AutomaticBrightnessController.java
-@@ -43,6 +43,7 @@ import android.os.Message;
- import android.os.PowerManager;
- import android.os.RemoteException;
- import android.os.SystemClock;
+diff --git a/services/core/java/com/android/server/display/AmbientLightCorrection.java b/services/core/java/com/android/server/display/AmbientLightCorrection.java
+new file mode 100644
+index 000000000000..be0fbdf99ef9
+--- /dev/null
++++ b/services/core/java/com/android/server/display/AmbientLightCorrection.java
+@@ -0,0 +1,183 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.display;
++
++import android.annotation.Nullable;
 +import android.os.SystemProperties;
- import android.os.Trace;
- import android.util.EventLog;
- import android.util.IndentingPrintWriter;
-@@ -65,6 +66,8 @@ import java.io.PrintWriter;
- import java.lang.annotation.Retention;
- import java.lang.annotation.RetentionPolicy;
- import java.util.concurrent.TimeUnit;
++import android.util.Slog;
++
++import com.android.internal.annotations.GuardedBy;
++
++import java.util.ArrayList;
 +import java.util.function.Consumer;
 +import java.util.function.DoubleUnaryOperator;
++
++/**
++ * Optional device-specific correction of ambient light sensor readings, for example to remove
++ * the light of the panel itself from the readings of an under-display sensor.
++ *
++ * <p>The implementation is the class named by {@code ro.vendor.display.als_correction_class},
++ * loaded from SYSTEMSERVERCLASSPATH. system_server creates one instance and every user of the
++ * light sensor shares it through its own {@link AmbientLightCorrection} client. The
++ * implementation has to be a {@link DoubleUnaryOperator} that maps raw lux to corrected lux on
++ * any thread, and may opt into two more contracts:
++ * <ul>
++ * <li>{@code Consumer<Boolean>}: called with {@code true} before the first client that needs the
++ * correction starts listening to the light sensor, and with {@code false} once the last one has
++ * stopped.
++ * <li>A public constructor taking a {@link Runnable}. The implementation may run it from any
++ * thread when its answer for the latest raw reading has changed; every listening client then
++ * corrects its latest raw reading again. It must not run it from inside its own methods or
++ * while holding a lock that they take.
++ * </ul>
++ * Without the property, readings pass through unchanged.
++ */
++public final class AmbientLightCorrection {
++    private static final String TAG = "AmbientLightCorrection";
++    private static final String PROP_CLASS = "ro.vendor.display.als_correction_class";
++
++    private static final Object sLock = new Object();
++    @GuardedBy("sLock")
++    private static final ArrayList<AmbientLightCorrection> sListening = new ArrayList<>();
++    @GuardedBy("sLock")
++    private static int sRequiredCount;
++    private static volatile boolean sFailureLogged;
++
++    /** Creates the shared implementation when the first client is constructed. */
++    private static final class Holder {
++        @Nullable
++        static final DoubleUnaryOperator CORRECTION = load();
++    }
++
++    @Nullable
++    private final DoubleUnaryOperator mCorrection = Holder.CORRECTION;
++    @Nullable
++    private final Runnable mOnReevaluate;
++    private final boolean mRequired;
++    @GuardedBy("sLock")
++    private boolean mListening;
++
++    /**
++     * @param onReevaluate run on an arbitrary thread when the latest raw reading of this client
++     *                     should go through {@link #correct} again; only while it is listening
++     * @param required whether the correction has to run for this client. A client that passes
++     *                 {@code false} gets corrected readings only while a required client keeps
++     *                 the correction running, and raw readings otherwise.
++     */
++    public AmbientLightCorrection(@Nullable Runnable onReevaluate, boolean required) {
++        mOnReevaluate = onReevaluate;
++        mRequired = required;
++    }
++
++    /** Call before registering and when unregistering the light sensor listener. */
++    public void setListening(boolean listening) {
++        synchronized (sLock) {
++            if (mListening == listening) {
++                return;
++            }
++            mListening = listening;
++            if (listening) {
++                sListening.add(this);
++            } else {
++                sListening.remove(this);
++            }
++            if (mRequired) {
++                sRequiredCount += listening ? 1 : -1;
++                if (sRequiredCount == (listening ? 1 : 0)) {
++                    notifyRunning(listening);
++                }
++            }
++        }
++    }
++
++    /** Returns the corrected reading, or {@code rawLux} if there is nothing to correct it with. */
++    public float correct(float rawLux) {
++        if (mCorrection == null || !Float.isFinite(rawLux) || rawLux < 0f) {
++            return rawLux;
++        }
++        try {
++            final float correctedLux = (float) mCorrection.applyAsDouble(rawLux);
++            if (Float.isFinite(correctedLux) && correctedLux >= 0f) {
++                return correctedLux;
++            }
++        } catch (RuntimeException | LinkageError e) {
++            logFailure(e);
++        }
++        return rawLux;
++    }
++
++    @Override
++    public String toString() {
++        return mCorrection == null ? "none" : mCorrection.toString();
++    }
++
++    @SuppressWarnings("unchecked")
++    @GuardedBy("sLock")
++    private void notifyRunning(boolean running) {
++        if (mCorrection instanceof Consumer<?>) {
++            try {
++                ((Consumer<Boolean>) mCorrection).accept(running);
++            } catch (RuntimeException | LinkageError e) {
++                logFailure(e);
++            }
++        }
++    }
++
++    /** Handed to the implementation; see the constructor contract in the class comment. */
++    private static void reevaluateAll() {
++        final AmbientLightCorrection[] clients;
++        synchronized (sLock) {
++            clients = sListening.toArray(new AmbientLightCorrection[0]);
++        }
++        for (AmbientLightCorrection client : clients) {
++            if (client.mOnReevaluate != null) {
++                client.mOnReevaluate.run();
++            }
++        }
++    }
++
++    private static void logFailure(Throwable error) {
++        if (!sFailureLogged) {
++            sFailureLogged = true;
++            Slog.w(TAG, "ALS correction failed, using unmodified lux", error);
++        }
++    }
++
++    @Nullable
++    private static DoubleUnaryOperator load() {
++        final String className = SystemProperties.get(PROP_CLASS);
++        if (className.isEmpty()) {
++            return null;
++        }
++
++        try {
++            final Class<?> clazz = Class.forName(className);
++            Object correction;
++            try {
++                final Runnable reevaluate = AmbientLightCorrection::reevaluateAll;
++                correction = clazz.getConstructor(Runnable.class).newInstance(reevaluate);
++            } catch (NoSuchMethodException e) {
++                correction = clazz.getDeclaredConstructor().newInstance();
++            }
++            Slog.i(TAG, "Loaded ALS correction: " + className);
++            return (DoubleUnaryOperator) correction;
++        } catch (ReflectiveOperationException | ClassCastException | LinkageError e) {
++            Slog.e(TAG, "Unable to load ALS correction: " + className, e);
++            return null;
++        }
++    }
++}
+diff --git a/services/core/java/com/android/server/display/AutomaticBrightnessController.java b/services/core/java/com/android/server/display/AutomaticBrightnessController.java
+index b8b4758277b2..1d482066ef38 100644
+--- a/services/core/java/com/android/server/display/AutomaticBrightnessController.java
++++ b/services/core/java/com/android/server/display/AutomaticBrightnessController.java
+@@ -534,9 +534,11 @@ public class AutomaticBrightnessController {
  
- /**
-  * Manages the associated display brightness when in auto-brightness mode. This is also
-@@ -628,6 +631,7 @@ public class AutomaticBrightnessController {
+     private void handleSettingsChange(boolean autoBrightnessOneShot) {
+         if (mAutoBrightnessOneShot && !autoBrightnessOneShot) {
++            setAlsCorrectionListening(mLightSensorEnabled);
+             mSensorManager.registerListener(mLightSensorListener, mLightSensor,
+                     mCurrentLightSensorRate * 1000, mHandler);
+         } else if (!mAutoBrightnessOneShot && autoBrightnessOneShot) {
++            setAlsCorrectionListening(false);
+             mSensorManager.unregisterListener(mLightSensorListener);
+         }
+         mAutoBrightnessOneShot = autoBrightnessOneShot;
+@@ -628,6 +630,7 @@ public class AutomaticBrightnessController {
          pw.println("Automatic Brightness Controller Configuration:");
          pw.println("----------------------------------------------");
          ipw.println("mState=" + configStateToString(mState));
@@ -27,77 +211,58 @@ index b8b4758277b2..c70d80013e58 100644
          ipw.println("mScreenBrightnessRangeMinimum=" + mScreenBrightnessRangeMinimum);
          ipw.println("mScreenBrightnessRangeMaximum=" + mScreenBrightnessRangeMaximum);
          ipw.println("mDozeScaleFactor=" + mDozeScaleFactor);
-@@ -722,6 +726,7 @@ public class AutomaticBrightnessController {
+@@ -722,6 +725,7 @@ public class AutomaticBrightnessController {
          if (enable) {
              if (!mLightSensorEnabled) {
                  mLightSensorEnabled = true;
-+                notifyAlsCorrectionLightSensorEnabled(true);
++                setAlsCorrectionListening(true);
                  mLightSensorEnableTime = mClock.uptimeMillis();
                  mCurrentLightSensorRate = mInitialLightSensorRate;
                  registerForegroundAppUpdater();
-@@ -731,6 +736,7 @@ public class AutomaticBrightnessController {
+@@ -731,6 +735,7 @@ public class AutomaticBrightnessController {
              }
          } else if (mLightSensorEnabled) {
              mLightSensorEnabled = false;
-+            notifyAlsCorrectionLightSensorEnabled(false);
++            setAlsCorrectionListening(false);
              mAmbientLuxValid = !mResetAmbientLuxAfterWarmUpConfig;
              if (!mAmbientLuxValid) {
                  mPreThresholdLux = PowerManager.BRIGHTNESS_INVALID_FLOAT;
-@@ -1436,13 +1442,70 @@ public class AutomaticBrightnessController {
+@@ -1054,6 +1059,7 @@ public class AutomaticBrightnessController {
+             mCallbacks.updateBrightness();
+         }
+         if (mAutoBrightnessOneShot) {
++            setAlsCorrectionListening(false);
+             mSensorManager.unregisterListener(mLightSensorListener);
+         }
+     }
+@@ -1436,14 +1442,45 @@ public class AutomaticBrightnessController {
          }
      }
  
-+    /** Optional device-specific correction loaded from SYSTEMSERVERCLASSPATH. */
-+    private final DoubleUnaryOperator mAlsCorrection = loadAlsCorrection();
-+    private boolean mAlsCorrectionFailureLogged;
++    /** Device-specific correction of light sensor readings; passes them through without one. */
++    private final AmbientLightCorrection mAlsCorrection =
++            new AmbientLightCorrection(this::requestAmbientLuxReevaluation, true /* required */);
++    // Latest reading of the registered listener as the sensor sent it, NaN if there is none.
++    private float mLastRawLux = Float.NaN;
 +
-+    /** Optional Consumer<Boolean> contract: reset correction state on ALS lifecycle transitions. */
-+    @SuppressWarnings("unchecked")
-+    private void notifyAlsCorrectionLightSensorEnabled(boolean enabled) {
-+        if (mAlsCorrection instanceof Consumer<?>) {
-+            try {
-+                ((Consumer<Boolean>) mAlsCorrection).accept(enabled);
-+            } catch (RuntimeException | LinkageError e) {
-+                logAlsCorrectionFailure(e);
-+            }
-+        }
++    /**
++     * Follows the light sensor listener itself, not mLightSensorEnabled: one-shot mode
++     * unregisters the listener while the sensor stays logically enabled.
++     */
++    private void setAlsCorrectionListening(boolean listening) {
++        mLastRawLux = Float.NaN;
++        mAlsCorrection.setListening(listening);
 +    }
 +
-+    private float correctAmbientLux(float rawLux) {
-+        try {
-+            final float correctedLux = (float) mAlsCorrection.applyAsDouble(rawLux);
-+            if (Float.isFinite(correctedLux) && correctedLux >= 0f) {
-+                return correctedLux;
-+            }
-+        } catch (RuntimeException | LinkageError e) {
-+            logAlsCorrectionFailure(e);
-+        }
-+        return rawLux;
++    /** Called by the correction on any thread when its answer for the latest reading changed. */
++    private void requestAmbientLuxReevaluation() {
++        mHandler.post(this::reevaluateAmbientLux);
 +    }
 +
-+    private void logAlsCorrectionFailure(Throwable error) {
-+        if (!mAlsCorrectionFailureLogged) {
-+            mAlsCorrectionFailureLogged = true;
-+            Slog.w(TAG, "ALS correction failed, using unmodified lux", error);
-+        }
-+    }
-+
-+    private static DoubleUnaryOperator loadAlsCorrection() {
-+        final String className = SystemProperties.get(
-+                "ro.vendor.display.als_correction_class");
-+        if (className.isEmpty()) {
-+            return value -> value;
-+        }
-+
-+        try {
-+            final Class<?> clazz = Class.forName(className);
-+            final DoubleUnaryOperator correction = (DoubleUnaryOperator)
-+                    clazz.getDeclaredConstructor().newInstance();
-+            Slog.i(TAG, "Loaded ALS correction: " + className);
-+            return correction;
-+        } catch (ReflectiveOperationException | ClassCastException | LinkageError e) {
-+            Slog.e(TAG, "Unable to load ALS correction: " + className, e);
-+            return value -> value;
++    private void reevaluateAmbientLux() {
++        if (mLightSensorEnabled && !Float.isNaN(mLastRawLux)) {
++            handleLightSensorEvent(mClock.getSensorEventScaleTime(),
++                    mAlsCorrection.correct(mLastRawLux));
 +        }
 +    }
 +
@@ -113,6 +278,91 @@ index b8b4758277b2..c70d80013e58 100644
 +                if (!Float.isFinite(rawLux) || rawLux < 0f) {
 +                    return;
 +                }
-+                handleLightSensorEvent(time, correctAmbientLux(rawLux));
++                mLastRawLux = rawLux;
++                handleLightSensorEvent(time, mAlsCorrection.correct(rawLux));
              }
          }
+ 
+diff --git a/services/core/java/com/android/server/display/mode/DisplayModeDirector.java b/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
+index 9e606a2e7ee2..9f66ed097827 100644
+--- a/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
++++ b/services/core/java/com/android/server/display/mode/DisplayModeDirector.java
+@@ -76,6 +76,7 @@ import com.android.internal.annotations.VisibleForTesting;
+ import com.android.internal.display.BrightnessSynchronizer;
+ import com.android.internal.os.BackgroundThread;
+ import com.android.server.LocalServices;
++import com.android.server.display.AmbientLightCorrection;
+ import com.android.server.display.DisplayDeviceConfig;
+ import com.android.server.display.config.IdleScreenRefreshRateTimeoutLuxThresholdPoint;
+ import com.android.server.display.config.RefreshRateData;
+@@ -1794,6 +1795,10 @@ public class DisplayModeDirector {
+         private String mLightSensorName;
+         private final LightSensorEventListener mLightSensorListener =
+                 new LightSensorEventListener();
++        // Not required: the zones use corrected lux only while auto-brightness keeps the
++        // device-specific correction running, and the raw sensor reading otherwise.
++        private final AmbientLightCorrection mAlsCorrection = new AmbientLightCorrection(
++                this::requestAmbientLuxReevaluation, false /* required */);
+         // Take it as low brightness before valid sensor data comes
+         private float mAmbientLux = -1.0f;
+         private AmbientFilter mAmbientFilter;
+@@ -2607,6 +2612,7 @@ public class DisplayModeDirector {
+                 unregisterSensorListener();
+             }
+ 
++            mAlsCorrection.setListening(true);
+             mSensorManager.registerListener(mLightSensorListener,
+                     mLightSensor, LIGHT_SENSOR_RATE_MS * 1000, mHandler);
+             mRegisteredLightSensor = mLightSensor;
+@@ -2615,8 +2621,14 @@ public class DisplayModeDirector {
+             }
+         }
+ 
++        /** Run by the correction on any thread when its answer for the latest reading changed. */
++        private void requestAmbientLuxReevaluation() {
++            mHandler.post(mLightSensorListener::reevaluate);
++        }
++
+         private void unregisterSensorListener() {
+             mLightSensorListener.removeCallbacks();
++            mAlsCorrection.setListening(false);
+             mSensorManager.unregisterListener(mLightSensorListener);
+             mRegisteredLightSensor = null;
+             if (mLoggingEnabled) {
+@@ -2645,6 +2657,8 @@ public class DisplayModeDirector {
+         private final class LightSensorEventListener implements SensorEventListener {
+             private static final int INJECT_EVENTS_INTERVAL_MS = LIGHT_SENSOR_RATE_MS;
+             private float mLastSensorData;
++            // The same reading as the sensor sent it, NaN if there is none to correct again.
++            private float mLastRawSensorData = Float.NaN;
+             private long mTimestamp;
+             private boolean mLoggingEnabled;
+ 
+@@ -2664,7 +2678,18 @@ public class DisplayModeDirector {
+ 
+             @Override
+             public void onSensorChanged(SensorEvent event) {
+-                mLastSensorData = event.values[0];
++                mLastRawSensorData = event.values[0];
++                handleSensorData(mAlsCorrection.correct(mLastRawSensorData));
++            }
++
++            void reevaluate() {
++                if (mRegisteredLightSensor != null && !Float.isNaN(mLastRawSensorData)) {
++                    handleSensorData(mAlsCorrection.correct(mLastRawSensorData));
++                }
++            }
++
++            private void handleSensorData(float lux) {
++                mLastSensorData = lux;
+                 if (mLoggingEnabled) {
+                     Slog.d(TAG, "On sensor changed: " + mLastSensorData);
+                 }
+@@ -2709,6 +2734,7 @@ public class DisplayModeDirector {
+ 
+             public void removeCallbacks() {
+                 mHandler.removeCallbacks(mInjectSensorEventRunnable);
++                mLastRawSensorData = Float.NaN;
+             }
+ 
+             private String formatTimestamp(long time) {

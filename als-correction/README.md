@@ -8,56 +8,51 @@ the sensor area can increase reported lux and automatic brightness.
 `MarbleAlsCorrection` samples a small framebuffer region above the sensor, converts each
 RGB primary to approximate linear panel emission, applies the measured TCS3701 spectral
 response and subtracts the estimated residual panel leakage before the value is consumed
-by `AutomaticBrightnessController`.
+by `AutomaticBrightnessController`. While auto-brightness keeps the correction running,
+`DisplayModeDirector` (the low-brightness refresh-rate zones) receives the corrected lux too.
 
 ## Integration
 
 The implementation is built as `marble-als-correction.jar`, installed in
 `/system_ext/framework`, and added to `SYSTEMSERVERCLASSPATH` by `device.mk`.
 
-The framework side deliberately contains only a generic optional plugin hook. The exact
-patch is stored in [`frameworks-base.patch`](frameworks-base.patch). Apply it from the
-Android source root with:
+The framework side contains only a generic optional plugin hook,
+`com.android.server.display.AmbientLightCorrection`, and its use in
+`AutomaticBrightnessController` and `DisplayModeDirector`. The exact patch is stored in
+[`frameworks-base.patch`](frameworks-base.patch). Apply it from the Android source root with:
 
 ```sh
 git -C frameworks/base apply \
     "$(pwd)/device/xiaomi/marble/als-correction/frameworks-base.patch"
 ```
 
-For reference, the functional part of the patch is:
+`AmbientLightCorrection` loads the class named by `ro.vendor.display.als_correction_class`
+once per `system_server` and shares that one instance between all users of the light sensor.
+The contract of the class is:
 
-```java
-private final DoubleUnaryOperator mAlsCorrection = loadAlsCorrection();
-
-private static DoubleUnaryOperator loadAlsCorrection() {
-    final String className = SystemProperties.get(
-            "ro.vendor.display.als_correction_class");
-    if (className.isEmpty()) {
-        return value -> value;
-    }
-
-    try {
-        return (DoubleUnaryOperator) Class.forName(className)
-                .getDeclaredConstructor().newInstance();
-    } catch (ReflectiveOperationException | ClassCastException | LinkageError e) {
-        Slog.e(TAG, "Unable to load ALS correction: " + className, e);
-        return value -> value;
-    }
-}
-```
+| Contract | Required | Meaning |
+|---|---|---|
+| `DoubleUnaryOperator` | yes | Raw lux in, corrected lux out. Called on any thread. |
+| `Consumer<Boolean>` | no | `accept(true)` before the first client that needs the correction registers its light-sensor listener, `accept(false)` once the last one has unregistered. |
+| Public constructor taking a `Runnable` | no | The correction runs it when its answer for the latest raw reading has changed. Every listening client then passes its latest raw reading through the operator again. |
 
 Finite, non-negative light-sensor events are passed through the operator. The framework
 validates its result and falls back to the original lux if correction returns an invalid
 value or throws a runtime/linkage exception.
 
-The implementation also implements `Consumer<Boolean>`. The optional framework lifecycle
-hook calls `accept(true)` before registering the ALS listener and `accept(false)` when
-unregistering it. Each transition invalidates the content cache and in-flight generation.
-Enable schedules an immediate background prewarm; disable cancels queued refreshes. No final
-sensor event with DBV=0 is needed to discard pre-sleep content. Install the
-updated framework hook together with the JAR; this implementation needs the enable callback.
+`AutomaticBrightnessController` is the client that needs the correction: its listener starts
+and stops the captures. This follows the listener itself, so one-shot auto-brightness, which
+unregisters the listener while the sensor stays logically enabled, stops them as well.
+`DisplayModeDirector` only uses the correction while it is running. With manual brightness
+its zones still see raw lux, so that no screen is captured while auto-brightness is off.
 
-If the property, JAR or implementation is missing, the operator is a no-op and stock
+Each transition invalidates the content cache and in-flight generation. Enable schedules an
+immediate background prewarm; disable cancels queued refreshes. No final sensor event with
+DBV=0 is needed to discard pre-sleep content. Install the updated framework hook together
+with the JAR: this implementation needs the enable callback, and without the `Runnable` it
+cannot correct a reading again (see "Re-evaluation" below).
+
+If the property, JAR or implementation is missing, readings pass through unchanged and stock
 automatic brightness behavior is preserved for valid sensor events. Implementations that
 only implement `DoubleUnaryOperator` remain supported without lifecycle notifications.
 
@@ -88,6 +83,11 @@ float properties must use a dot as the decimal separator (`0.14`, not `0,14`).
 
 Recommended user-facing UI ranges are narrower than the hard clamps:
 `k` 400–900, `ref_luma` 0.05–0.30, `gamma` 1.8–2.6, `interval_ms` one of 250/500 (Fast/Balanced; default 500).
+
+The corrector also reads two properties that it does not own, to know SurfaceFlinger's global
+saturation: `sys.parts.sf_saturation`, which the XiaomiParts saturation control writes each
+time it applies a value, and the framework's `persist.sys.sf.color_saturation` when that one
+is unset.
 
 ### State property
 
@@ -165,9 +165,15 @@ unprivileged applications and shell users cannot normally change `persist.sys.*`
 * Increase `ref_luma` if status-bar icons or a dark UI are being over-corrected.
 * Do not change `cx`, `cy` or `r` unless panel coordinates or the sampled sensor area are known
   to be wrong.
-* The default `k` of 550 is a chosen value, not a measured one. White/black measurements at
-  DBV 250/500/1000/2000 give `k` = 625..656, so the default leaves about 12-16% of the
-  white-content leakage uncorrected. Use about 640 to match those measurements.
+* The default `k` of 550 was lowered from the measured range to avoid over-subtracting under
+  mixed content. The measurements do not agree on one value: white/black at DBV
+  250/500/1000/2000 gives `k` = 620..656; white/black at DBV 4095 (497 vs 181 lux) gives 548
+  if the same framebuffer delta-luma of 0.5763 applies to it; the red + green + blue sum at
+  DBV 4095 is 752 lux; twelve single light/dark theme transitions at DBV 123-252, taken under
+  room light that was not held constant, give 420..630 with a median of about 520. By the
+  first set the default leaves 11-16% of the white-content leakage uncorrected up to DBV 2000
+  and about 640 matches it; by the last one 550 is about right at low brightness. Measuring
+  all of them again in one session would settle which one describes the panel.
 * Change one parameter at a time under stable external lighting and compare white/dark content
   at the same fixed DBV.
 
@@ -193,10 +199,21 @@ neutral white/gray content and dark UIs where all primaries are below `ref_luma`
 identically to a post-sum threshold, while saturated blue (`#0000FF`) and red (`#FF0000`)
 content above the sensor are compensated proportionally to their measured TCS3701 response.
 
+SurfaceFlinger applies the display color transform to the panel but renders screenshots
+without it. The corrector therefore rebuilds that transform and applies it to every sampled
+pixel before averaging: all matrices held by `DisplayTransformManager` (night light, display
+white balance, saturation, grayscale, extra dim, color inversion, LineageOS calibration and
+reading mode), composed in ascending level order, times SurfaceFlinger's global saturation
+matrix. It is applied in linear light when `DisplayTransformManager.needsLinearColorMatrix()`
+says so, and to the gamma-encoded values otherwise. With color inversion a white framebuffer
+is a black panel; without this step the correction subtracted leakage that was not there.
+The daltonizer of the color-correction accessibility modes is known only inside
+SurfaceFlinger and is not modelled; it leaves neutral colors unchanged.
+
 The correction formula is approximately:
 
 ```text
-meanR/G/B = discMean(pow(capturedR/G/B / 255, gamma))
+meanR/G/B = discMean(colorTransform(pow(capturedR/G/B / 255, gamma)))
 excessContent = 0.1810 * max(0, meanR - refLuma)
     + 0.7234 * max(0, meanG - refLuma)
     + 0.0956 * max(0, meanB - refLuma)
@@ -207,7 +224,8 @@ correctedLux = max(0, rawLux
 ## Capture safety
 
 `ScreenCaptureInternal.captureDisplay()` runs asynchronously on a dedicated background thread.
-The display-power/ALS callback never waits for SurfaceFlinger and does not schedule captures.
+The display-power/ALS callback never waits for SurfaceFlinger; for a new reading it only posts
+a capture request to that thread.
 The worker requires the default display to be `STATE_ON` (not OFF or doze), readable positive
 DBV, and the enable property before capture, and checks them again before accepting the result. Unknown DBV/max DBV
 passes through the original lux; it is never interpreted as maximum brightness. The maximum
@@ -234,12 +252,49 @@ the first lux after every long pause uncorrected, even while the screen remained
 The worker now refreshes periodically while the ALS listener is enabled. The first request
 is scheduled at listener enable, and each completed request schedules at most one successor.
 Successful requests wait `interval_ms` after completion: no overlapping captures, catch-up
-bursts, or queue growth if SurfaceFlinger is slow. Captures only update the content cache;
-they never inject synthetic sensor events, reuse old lux, or force brightness updates.
-The next real ALS event consumes the latest fresh content with the current DBV.
+bursts, or queue growth if SurfaceFlinger is slow. Periodic captures only update the content
+cache. An ALS event consumes the latest fresh content with the current DBV.
+
+### Re-evaluation of a reading corrected with outdated content
+
+TYPE_LIGHT is on-change, and what changes the reading is often the screen above the sensor.
+Such a reading can arrive before any capture has seen the new content. It is then corrected
+with the previous content: after white -> dark at DBV 2000 a true 100 lux became 0 and stayed
+0 until the light changed, because the sensor had nothing new to report.
+
+Three things prevent that:
+
+* Every new reading posts a capture, so the screen is sampled as it is right after the
+  reading. The same value delivered to a second listener does not count as new.
+* The worker tracks the leakage estimate, which covers content and DBV together. When it
+  changes by more than max(1 lux, 5%), a new run starts.
+* Once a run has held for 600 ms, long enough for a theme or window transition to finish, a
+  reading that arrived after the last capture of the previous run is checked. If correcting
+  it with the current estimate changes the result by more than max(1 lux, 5%), the corrector
+  runs the framework's `Runnable` and each listener passes its latest raw lux through the
+  corrector again. A capture is scheduled to land on the 600 ms mark.
+
+The corrected value reaches `AutomaticBrightnessController` as one more sample, at most
+600 ms plus three capture durations after the reading. That is inside the 1000 ms brightening
+debounce of the sm8450 overlay, so a sample that was too bright is replaced before it can
+raise the brightness. A reading that predates the last capture of the previous content is
+left alone: it was corrected consistently. The sensor reports a changed leakage anywhere from
+0.2 s to several seconds after the screen changed, and at low brightness sometimes not within
+7 s; whenever it does, that reading is corrected with the content cached by then.
+
+Measured on marble (light/dark Settings toggled nine times at DBV 252 under about 128 lux):
+raw lux alternated between about 128 and 147, corrected lux stayed within 123.6-128.1 and
+auto-brightness did not move. In five of the nine transitions the reading arrived before a
+capture had seen the new content and came out as 147 or 108; each was replaced by the right
+value 0.4-0.65 s later.
+
+This is the only case in which an old raw lux is used again. Periodic captures on their own
+still never create samples or force brightness updates.
 
 OFF/doze, unavailable DBV and capture failures use a retry delay of
-`max(interval_ms, 1000)` ms. Disabled correction (`enabled=false`) stops the background
+`max(interval_ms, 1000)` ms. The listener is enabled before the panel is on, so for the first
+2 s after enable a panel that is not on yet is checked every 100 ms instead; content is then
+ready for the first reading after wake. Disabled correction (`enabled=false`) stops the background
 refresh timer completely (zero periodic wakeups) and resumes immediately on a sysprop change
 notification from XiaomiParts or on the next ALS event. `SystemProperties.reportSyspropChanged()`
 only reaches callbacks inside the calling process, so XiaomiParts sends `SYSPROPS_TRANSACTION`
@@ -252,9 +307,10 @@ be cancelled, but its old-generation result is discarded. Re-enabling during tha
 schedules a fresh prewarm as soon as it finishes.
 
 The first ALS event immediately after wake can still precede the first successful capture;
-it intentionally passes through rather than using pre-sleep content or blocking the display.
-A capture also cannot undo redaction, account for every post-composition panel transform,
-or guarantee pixel/sensor timestamp alignment. This is a bounded-delay compensation model.
+it passes through rather than using pre-sleep content or blocking the display, and is
+corrected again through the re-evaluation above. A capture also cannot undo redaction,
+account for panel-side processing after SurfaceFlinger's color transform, or guarantee
+pixel/sensor timestamp alignment. This is a bounded-delay compensation model.
 
 Secure and protected-content policies explicitly reject the capture, rather than treating
 redacted black pixels as actual panel emission. Protected pixels are never requested.
@@ -275,8 +331,10 @@ pixels); DBV is read on the ALS callback and around each capture. The main cost 
 
 At defaults:
 
-* with the default `interval_ms=500`, capture is limited to at most **2 times per second**;
-  actual frequency is lower because the delay starts after capture completes;
+* with the default `interval_ms=500`, periodic capture is limited to at most **2 times per
+  second**; actual frequency is lower because the delay starts after capture completes;
+* each new sensor reading adds one capture, and a change of the leakage estimate adds one on
+  the 600 ms mark instead of at the regular interval;
 * only a roughly `94 x 94` source region is requested and downscaled to `16 x 16`;
 * new capture requests run only while the ALS listener is enabled; an already running capture
   may finish after disable, but its result is discarded;
@@ -315,7 +373,17 @@ Important fields:
   accepted successes, capture failures, unusable/obsolete results and expired cached samples.
 * `lastCaptureAgeMs`, `lastCaptureDurationMs`: time since completion and processing duration
   of the last attempted capture, including its availability checks.
-* `alsSamples`, `lastAlsAgeMs`, `lastRawLux`, `lastCorrectedLux`: actual sensor callbacks.
+* `alsSamples`, `lastAlsAgeMs`, `lastRawLux`, `lastCorrectedLux`: actual sensor callbacks of
+  all listeners (`AutomaticBrightnessController` and `DisplayModeDirector` each deliver the
+  same reading), without re-evaluations.
+* `reevaluateRequests`, `reevaluated`: how often the corrector asked the framework to pass the
+  latest raw lux through again, and how many such samples came back. Requests should be rare
+  and happen right after content changes; a count that grows under a static screen is not
+  expected.
+* `runLeakage`, `runAgeMs`: the leakage estimate in lux of the current run and how long it has
+  held; NaN and -1 without a usable capture.
+* `colorTransform`: a display color transform other than identity was applied to the cached
+  sample.
 * `cacheMisses`: sensor callbacks passed through uncorrected only because no fresh content was
   cached (correction enabled, listener active, DBV readable). TYPE_LIGHT is on-change, so such
   a lux value stays in effect until the sensor reports again. An occasional miss right after

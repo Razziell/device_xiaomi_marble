@@ -47,6 +47,7 @@ import android.graphics.Bitmap;
 import android.graphics.Rect;
 import android.hardware.HardwareBuffer;
 import android.hardware.display.DisplayManagerInternal;
+import android.opengl.Matrix;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
@@ -63,6 +64,7 @@ import android.window.ScreenCaptureInternal;
 
 import com.android.internal.os.BackgroundThread;
 import com.android.server.LocalServices;
+import com.android.server.display.color.DisplayTransformManager;
 
 import java.io.FileInputStream;
 import java.lang.ref.WeakReference;
@@ -84,16 +86,24 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     private static final int DEF_RADIUS = 47;
 
     /**
-     * Lux subtracted for a fully white disc at maximum panel brightness.
-     * Derived from fixed-DBV measurements on marble.
+     * Lux subtracted for a fully lit disc at maximum panel brightness.
+     *
+     * Three sets of measurements exist on marble, and no single k that is linear in DBV fits
+     * all of them:
+     *   - white vs black at DBV 250/500/1000/2000: 21.96/43.63/88.41/184.61 lux. With the
+     *     framebuffer delta-luma of 0.5763 measured for that content, k = 624/620/628/656.
+     *   - white vs black at DBV 4095: 497 vs 181 lux (file header). k = 548 if the delta-luma
+     *     was the same 0.5763, which is an assumption.
+     *   - full red + green + blue at DBV 4095 (the spectral weights below): 752 lux in total.
+     *   - light vs dark Settings at DBV 123-252, twelve single transitions taken while
+     *     checking this code under room light that was not held constant: k = 420..630,
+     *     median about 520.
+     * The default was lowered to 550 to avoid over-subtracting under mixed content. By the
+     * first set it leaves 11-16% of the white-content leakage in the reading up to DBV 2000
+     * (155 instead of 185 lux at DBV 2000), and persist.sys.als_correction.k = 640 matches
+     * that set; by the last one 550 is about right at low brightness. Which set describes
+     * the panel best is open until they are measured again in one session.
      */
-    // Measured on the connected marble across DBV 250/500/1000/2000:
-    // delta(white-black) = 21.96/43.63/88.41/184.61 lux. Together with the measured
-    // framebuffer delta-luma=0.5763 this gives k=625..656.
-    // The shipped default is deliberately lower than that. It is a chosen value, not a
-    // measured one: by the numbers above it leaves about 12-16% of the white-content leakage
-    // uncorrected (155 instead of 185 lux at DBV 2000). Set persist.sys.als_correction.k to
-    // about 640 for a correction that matches the measurements.
     private static final int DEF_K = 550;
 
     // Settings in dark mode is not pixel-black around the sensor because of status-bar icons.
@@ -153,6 +163,38 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     /** Never subtract leakage from content sampled before a long gap or a slow capture. */
     private static final long MAX_CONTENT_AGE_MS = 2000;
 
+    /**
+     * How long the leakage estimate has to hold before the latest raw lux is corrected again
+     * with it: long enough for a theme or window transition above the sensor to finish, so
+     * that the estimate is the one for the content that stays. Every new reading triggers a
+     * capture, so the second look comes at most SETTLE_MS plus three capture durations after
+     * the reading; 0.4-0.65 s was measured on marble. That is inside the 1000 ms brightening
+     * debounce of the sm8450 overlay: a sample corrected with outdated content is replaced
+     * before it can raise the brightness.
+     */
+    private static final long SETTLE_MS = 600;
+
+    /** A re-evaluation that was asked for is expected back within this time. */
+    private static final long REEVALUATE_WINDOW_MS = 1000;
+
+    /** Lux and leakage differences below max(1 lux, 5%) are not worth a new sample. */
+    private static final float SIGNIFICANT_LUX = 1f;
+    private static final float SIGNIFICANT_FRACTION = 0.05f;
+
+    /** The ALS listener starts while the panel is still turning on; look again this often. */
+    private static final long WAKE_RETRY_INTERVAL_MS = 100;
+    private static final long WAKE_RETRY_WINDOW_MS = 2000;
+
+    /**
+     * DisplayTransformManager hands out its color matrices per level only. The levels used in
+     * this tree end at 350 (framework tints, LineageOS calibration and reading mode).
+     */
+    private static final int COLOR_MATRIX_LEVEL_LIMIT = 512;
+
+    /** Global saturation of SurfaceFlinger: as XiaomiParts applied it, else the framework's. */
+    private static final String PARTS_SATURATION_PROP = "sys.parts.sf_saturation";
+    private static final String SF_SATURATION_PROP = "persist.sys.sf.color_saturation";
+
     private static final String BACKLIGHT_PATH =
             "/sys/class/backlight/panel0-backlight/brightness";
     private static final String MAX_BACKLIGHT_PATH =
@@ -182,6 +224,8 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     private float mLastGreenNorm = -1f;
     private float mLastBlueNorm = -1f;
     private boolean mCapturePending;
+    // A new reading arrived during the running capture; capture again as soon as it is done.
+    private boolean mRefreshAfterCapture;
     private boolean mRefreshScheduled;
     private boolean mLightSensorEnabled;
     private int mCaptureGeneration;
@@ -201,11 +245,35 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     private float mLastRawLux = Float.NaN;
     private float mLastCorrectedLux = Float.NaN;
     private long mLastUsedCacheAgeMs = -1;
-    // Only accessed on the ALS callback looper. Retry sysfs until a valid maximum is available.
-    private float mMaxBacklight = -1f;
+    // A run is a stretch of captures with the same leakage estimate. Guarded by mLock.
+    private long mRunStartElapsed = -1;
+    private float mRunLeakage;
+    // Start of the last capture that still belonged to the previous run, -1 if there was none.
+    private long mPrevRunEndElapsed = -1;
+    private long mLastGoodCaptureElapsed = -1;
+    private long mReevaluateRequestElapsed = -1;
+    private long mReevaluateRequests;
+    private long mReevaluatedSamples;
+    private boolean mColorTransformApplied;
+    // Asks the framework to pass the latest raw lux through again. Null with an older hook.
+    private final Runnable mReevaluate;
+    private boolean mReevaluateFailedLogged;
+    // Read on the ALS callback loopers and the capture worker; retried until it is valid.
+    private volatile float mMaxBacklight = -1f;
+    // Only accessed while holding mAlsSysfsBuf: more than one looper may deliver ALS events.
     private final byte[] mAlsSysfsBuf = new byte[16];
     // Only accessed on the capture worker thread.
     private final byte[] mWorkerSysfsBuf = new byte[16];
+    private float mWorkerDbvNorm = -1f;
+    private float[] mColorTransform;
+    private boolean mColorTransformLinear;
+    private boolean mColorTransformFailedLogged;
+    private final float[] mMatrixA = new float[16];
+    private final float[] mMatrixB = new float[16];
+    private final float[] mSaturationMatrix = new float[16];
+    private double mSumR;
+    private double mSumG;
+    private double mSumB;
     private final int[] mPixelBuffer = new int[SAMPLE_EDGE * SAMPLE_EDGE];
     private final float[] mRgbScratch = new float[3];
     private final float[] mGammaLut = new float[256];
@@ -230,14 +298,26 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
         setStateProp(state);
     };
 
+    /** For a framework hook that cannot ask for re-evaluation. */
     public MarbleAlsCorrection() {
+        this(null);
+    }
+
+    /**
+     * @param reevaluate makes the framework pass the latest raw lux of every light sensor
+     *                   listener through {@link #applyAsDouble} again; safe on any thread
+     */
+    public MarbleAlsCorrection(Runnable reevaluate) {
+        mReevaluate = reevaluate;
         SystemProperties.addChangeCallback(new SyspropCallback(this));
     }
 
     /**
-     * AutomaticBrightnessController is recreated on display configuration changes and there is
-     * no teardown hook, while SystemProperties keeps its callbacks forever. Hold the corrector
-     * weakly and unregister once it is gone, so replaced instances can be collected.
+     * SystemProperties keeps its callbacks forever and there is no teardown hook. The current
+     * framework hook creates one corrector per system_server, but the first version of the hook
+     * created one per AutomaticBrightnessController, which is recreated on display
+     * configuration changes. Hold the corrector weakly and unregister once it is gone, so
+     * replaced instances can be collected.
      */
     private static final class SyspropCallback implements Runnable {
         private final WeakReference<MarbleAlsCorrection> mCorrection;
@@ -292,6 +372,10 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             }
             CAPTURE_HANDLER.removeCallbacks(mRefreshContent);
             mRefreshScheduled = false;
+            mRefreshAfterCapture = false;
+            // Readings of the previous listener session must not be corrected again.
+            mLastRawLux = Float.NaN;
+            mReevaluateRequestElapsed = -1;
             invalidateContentLumaLocked();
             final boolean correctionEnabled = isCorrectionEnabled();
             publishStateLocked(!correctionEnabled ? STATE_OFF
@@ -313,20 +397,33 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
      */
     @Override
     public double applyAsDouble(double rawLux) {
+        final float raw = (float) rawLux;
+        final long now = SystemClock.elapsedRealtime();
+        // The same value again is the reading we already have: delivered to a second listener
+        // of the sensor, or passed through again because we asked for it.
+        final boolean newReading;
+        final boolean reevaluation;
         synchronized (mLock) {
             mLastUsedCacheAgeMs = -1;
+            newReading = raw != mLastRawLux;
+            reevaluation = !newReading && mReevaluateRequestElapsed >= 0
+                    && now - mReevaluateRequestElapsed < REEVALUATE_WINDOW_MS;
         }
-        final float correctedLux = correct((float) rawLux);
+        final float correctedLux = correct(raw, newReading);
         synchronized (mLock) {
-            mAlsSamples++;
-            mLastAlsElapsed = SystemClock.elapsedRealtime();
-            mLastRawLux = (float) rawLux;
+            if (reevaluation) {
+                mReevaluatedSamples++;
+            } else {
+                mAlsSamples++;
+                mLastAlsElapsed = now;
+            }
+            mLastRawLux = raw;
             mLastCorrectedLux = correctedLux;
         }
         return correctedLux;
     }
 
-    private float correct(float rawLux) {
+    private float correct(float rawLux, boolean newReading) {
         if (!Float.isFinite(rawLux) || rawLux < 0f) {
             return rawLux;
         }
@@ -341,7 +438,10 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
 
         // Use current DBV, not the brightness at the time of the cached capture. The worker
         // independently checks the display state and DBV before/after every capture.
-        final float dbvNorm = getBacklightNorm();
+        final float dbvNorm;
+        synchronized (mAlsSysfsBuf) {
+            dbvNorm = getBacklightNorm(mAlsSysfsBuf);
+        }
         if (dbvNorm <= 0f) {
             synchronized (mLock) {
                 invalidateContentLumaLocked();
@@ -366,10 +466,20 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 mLastUsedCacheAgeMs = now - mLastLumaElapsed;
             } else {
                 mCacheMisses++;
-                if (!mCapturePending && !mRefreshScheduled) {
-                    // Recover if enabled via adb setprop, which does not notify system_server.
+            }
+            if (newReading) {
+                // The sensor reports on change, and what changed is often the screen above
+                // it. Look at the screen as it is after this reading instead of waiting for
+                // the periodic capture: if the content is new, this reading is corrected
+                // again once the estimate has settled. Also recovers after enabling via adb
+                // setprop, which does not notify system_server.
+                if (mCapturePending) {
+                    mRefreshAfterCapture = true;
+                } else {
                     scheduleRefreshLocked(0);
                 }
+            } else if (lumaNorm < 0f && !mCapturePending && !mRefreshScheduled) {
+                scheduleRefreshLocked(0);
             }
         }
         if (lumaNorm < 0f) {
@@ -378,6 +488,19 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             return rawLux;
         }
 
+        final float leakage = leakageLux(rNorm, gNorm, bNorm, dbvNorm);
+        final float corrected = Math.max(0f, rawLux - leakage);
+
+        if (DEBUG) {
+            Slog.d(TAG, "raw=" + rawLux + " luma=" + lumaNorm + " dbv=" + dbvNorm
+                    + " leak=" + leakage + " -> " + corrected
+                    + (newReading ? "" : " (again)"));
+        }
+        return Float.isFinite(corrected) ? corrected : rawLux;
+    }
+
+    /** Lux that the panel adds to the sensor reading for this content at this DBV. */
+    private static float leakageLux(float rNorm, float gNorm, float bNorm, float dbvNorm) {
         final float k = clamp(
                 SystemProperties.getInt("persist.sys.als_correction.k", DEF_K), K_MIN, K_MAX);
         final float referenceLuma = clamp(
@@ -393,14 +516,60 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
         final float excessContent = (float) (RED_WEIGHT * effR
                 + GREEN_WEIGHT * effG
                 + BLUE_WEIGHT * effB);
-        final float leakage = k * excessContent * dbvNorm;
-        final float corrected = Math.max(0f, rawLux - leakage);
+        return k * excessContent * dbvNorm;
+    }
 
-        if (DEBUG) {
-            Slog.d(TAG, "raw=" + rawLux + " luma=" + lumaNorm + " excess=" + excessContent
-                    + " dbv=" + dbvNorm + " leak=" + leakage + " -> " + corrected);
+    private static boolean isSignificantChange(float a, float b) {
+        return Math.abs(a - b) >= Math.max(SIGNIFICANT_LUX,
+                SIGNIFICANT_FRACTION * Math.max(Math.abs(a), Math.abs(b)));
+    }
+
+    /**
+     * Caller holds mLock, on the capture worker, after a capture was accepted. Returns true if
+     * the latest raw lux has to be corrected again.
+     *
+     * An ALS event that arrived after the last capture of the previous content was most
+     * likely caused by the new content, but may have been corrected with the previous one,
+     * and nothing else would correct it until the light changes. Once the new estimate has
+     * held for SETTLE_MS, that reading is corrected again with it. An event older than that
+     * was corrected consistently and is left alone. On marble the sensor reported a changed
+     * leakage anywhere from 0.2 s to several seconds after the screen changed, and at low
+     * brightness sometimes not within 7 s; whenever it does report, that reading is corrected
+     * with the content cached by then.
+     */
+    private boolean trackLeakageLocked(long captureStarted, long now, float leakage) {
+        final long lastGoodCapture = mLastGoodCaptureElapsed;
+        mLastGoodCaptureElapsed = captureStarted;
+        if (mRunStartElapsed < 0 || isSignificantChange(leakage, mRunLeakage)) {
+            mPrevRunEndElapsed = lastGoodCapture;
+            mRunStartElapsed = captureStarted;
+            mRunLeakage = leakage;
+            return false;
         }
-        return Float.isFinite(corrected) ? corrected : rawLux;
+        if (mReevaluate == null || now - mRunStartElapsed < SETTLE_MS
+                || Float.isNaN(mLastRawLux) || mLastAlsElapsed <= mPrevRunEndElapsed) {
+            return false;
+        }
+        if (mReevaluateRequestElapsed >= 0
+                && now - mReevaluateRequestElapsed < REEVALUATE_WINDOW_MS) {
+            return false;
+        }
+        if (!isSignificantChange(Math.max(0f, mLastRawLux - leakage), mLastCorrectedLux)) {
+            return false;
+        }
+        mReevaluateRequestElapsed = now;
+        mReevaluateRequests++;
+        return true;
+    }
+
+    /** Caller holds mLock. Lands a capture on the moment the current run has settled. */
+    private long refreshDelayLocked(long now, long intervalMs) {
+        final long untilSettled = mRunStartElapsed + SETTLE_MS - now;
+        if (mReevaluate == null || mRunStartElapsed < 0 || untilSettled <= 0) {
+            return intervalMs;
+        }
+        // Wait a little longer than the interval rather than capture twice in quick succession.
+        return untilSettled - intervalMs < intervalMs / 2 ? untilSettled : intervalMs;
     }
 
     private static long getCaptureIntervalMs() {
@@ -436,11 +605,12 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
         float rNorm = -1f;
         float gNorm = -1f;
         float bNorm = -1f;
+        float leakage = 0f;
         boolean attempted = false;
         String unavailableState = STATE_PENDING;
         try {
             // Skip expensive work when disabled, screen OFF/dozing, or DBV is unreadable.
-            unavailableState = getUnavailableState(mWorkerSysfsBuf);
+            unavailableState = getUnavailableState();
             if (unavailableState == null) {
                 attempted = true;
                 final Bitmap bitmap = captureSensorRegion();
@@ -454,13 +624,17 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                         bitmap.recycle();
                     }
                 }
-                unavailableState = getUnavailableState(mWorkerSysfsBuf);
+                unavailableState = getUnavailableState();
+                if (unavailableState == null && luma >= 0f) {
+                    leakage = leakageLux(rNorm, gNorm, bNorm, mWorkerDbvNorm);
+                }
             }
         } catch (RuntimeException | LinkageError e) {
             logCaptureFailure(e);
             luma = -1f;
             unavailableState = STATE_CAPTURE_FAILED;
         } finally {
+            boolean reevaluate = false;
             synchronized (mLock) {
                 mCapturePending = false;
                 final long now = SystemClock.elapsedRealtime();
@@ -489,15 +663,23 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                                 mDiscardedCaptures++;
                             }
                         }
+                        mRunStartElapsed = -1;
                         publishStateLocked(unavailableState);
                         if (STATE_OFF.equals(unavailableState)) {
                             // Stop background wakeups completely when correction is disabled.
                             shouldSchedule = false;
+                        } else if (STATE_IDLE.equals(unavailableState) && mLastEnableElapsed >= 0
+                                && now - mLastEnableElapsed < WAKE_RETRY_WINDOW_MS) {
+                            // The listener was enabled before the panel is on. Have content
+                            // ready for the first reading instead of a second later.
+                            nextDelayMs = WAKE_RETRY_INTERVAL_MS;
                         }
                     } else if (!Float.isFinite(luma) || luma < 0f) {
+                        mRunStartElapsed = -1;
                         mCaptureFailures++;
                         publishStateLocked(STATE_CAPTURE_FAILED);
                     } else if (now - captureStarted >= MAX_CONTENT_AGE_MS) {
+                        mRunStartElapsed = -1;
                         mDiscardedCaptures++;
                         publishStateLocked(STATE_PENDING);
                     } else {
@@ -511,18 +693,40 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                         publishStateLocked(STATE_ACTIVE);
                         STATE_HANDLER.postDelayed(mExpireContent,
                                 MAX_CONTENT_AGE_MS - (now - captureStarted));
-                        nextDelayMs = getCaptureIntervalMs();
+                        mColorTransformApplied = mColorTransform != null;
+                        reevaluate = trackLeakageLocked(captureStarted, now, leakage);
+                        nextDelayMs = refreshDelayLocked(now, getCaptureIntervalMs());
                     }
+                }
+                if (mRefreshAfterCapture) {
+                    // Started before the latest reading: look again at what is shown after it.
+                    mRefreshAfterCapture = false;
+                    nextDelayMs = 0;
                 }
                 if (shouldSchedule) {
                     scheduleRefreshLocked(nextDelayMs);
                 }
             }
+            if (reevaluate) {
+                // Outside mLock: the framework takes its own lock, which it also holds while
+                // calling accept().
+                try {
+                    mReevaluate.run();
+                } catch (RuntimeException | LinkageError e) {
+                    if (!mReevaluateFailedLogged) {
+                        mReevaluateFailedLogged = true;
+                        Slog.w(TAG, "cannot ask for re-evaluation", e);
+                    }
+                }
+            }
         }
     }
 
-    /** null means capture is usable; an empty state means display/DBV information is unavailable. */
-    private static String getUnavailableState(byte[] sysfsBuf) {
+    /**
+     * null means capture is usable and mWorkerDbvNorm holds the DBV; an empty state means
+     * display/DBV information is unavailable. Runs only on the capture worker.
+     */
+    private String getUnavailableState() {
         if (!isCorrectionEnabled()) {
             return STATE_OFF;
         }
@@ -533,8 +737,8 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
         if (info.state != Display.STATE_ON) {
             return STATE_IDLE;
         }
-        final float dbv = readSysfsFloat(BACKLIGHT_PATH, sysfsBuf);
-        return dbv < 0f ? STATE_PENDING : dbv == 0f ? STATE_IDLE : null;
+        mWorkerDbvNorm = getBacklightNorm(mWorkerSysfsBuf);
+        return mWorkerDbvNorm < 0f ? STATE_PENDING : mWorkerDbvNorm == 0f ? STATE_IDLE : null;
     }
 
     private void expireContent() {
@@ -554,6 +758,8 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     /** Caller holds mLock. Keep pending set until the old worker exits; never queue duplicates. */
     private void invalidateContentLumaLocked() {
         mCaptureGeneration++;
+        mRunStartElapsed = -1;
+        mLastGoodCaptureElapsed = -1;
         clearContentLumaLocked();
     }
 
@@ -613,7 +819,9 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             mDiscRadiusX = (float) r / crop.width();
             mDiscRadiusY = (float) r / crop.height();
 
-            final float scale = (float) SAMPLE_EDGE / Math.max(crop.width(), crop.height());
+            // SurfaceFlinger truncates crop * scale, and 16f / 94 * 94 is 15.999999 in float.
+            // Aim for the middle of the last pixel so that the default crop really is 16 x 16.
+            final float scale = (SAMPLE_EDGE + 0.5f) / Math.max(crop.width(), crop.height());
 
             IBinder token = mDisplayToken;
             if (token == null) {
@@ -729,10 +937,11 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 GAMMA_MIN, GAMMA_MAX);
         final float[] lut = getGammaLut(gamma);
         final boolean useStaticMask = !mDiscClipped && w == SAMPLE_EDGE && h == SAMPLE_EDGE;
+        updateColorTransform();
 
-        double sumR = 0;
-        double sumG = 0;
-        double sumB = 0;
+        mSumR = 0;
+        mSumG = 0;
+        mSumB = 0;
         int samples = 0;
 
         if (useStaticMask) {
@@ -740,10 +949,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 if (!DISC_MASK[i]) {
                     continue;
                 }
-                final int px = pixels[i];
-                sumR += lut[(px >> 16) & 0xFF];
-                sumG += lut[(px >> 8) & 0xFF];
-                sumB += lut[px & 0xFF];
+                addPixel(pixels[i], lut);
                 samples++;
             }
         } else {
@@ -759,10 +965,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                     if (dx * dx + dy * dy > 1f) {
                         continue;
                     }
-                    final int px = pixels[y * w + x];
-                    sumR += lut[(px >> 16) & 0xFF];
-                    sumG += lut[(px >> 8) & 0xFF];
-                    sumB += lut[px & 0xFF];
+                    addPixel(pixels[y * w + x], lut);
                     samples++;
                 }
             }
@@ -774,25 +977,142 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             outRgb[2] = 0f;
             return 0f;
         }
-        final float meanR = (float) (sumR / samples);
-        final float meanG = (float) (sumG / samples);
-        final float meanB = (float) (sumB / samples);
+        final float meanR = (float) (mSumR / samples);
+        final float meanG = (float) (mSumG / samples);
+        final float meanB = (float) (mSumB / samples);
         outRgb[0] = meanR;
         outRgb[1] = meanG;
         outRgb[2] = meanB;
         return (float) (RED_WEIGHT * meanR + GREEN_WEIGHT * meanG + BLUE_WEIGHT * meanB);
     }
 
+    /** Adds one captured pixel the way the panel emits it. Capture worker only. */
+    private void addPixel(int px, float[] lut) {
+        final int r8 = (px >> 16) & 0xFF;
+        final int g8 = (px >> 8) & 0xFF;
+        final int b8 = px & 0xFF;
+        final float[] m = mColorTransform;
+        if (m == null) {
+            mSumR += lut[r8];
+            mSumG += lut[g8];
+            mSumB += lut[b8];
+            return;
+        }
+        // Column-major 4x4 as SurfaceFlinger receives it; the fourth column is an offset.
+        final boolean linear = mColorTransformLinear;
+        final float r = linear ? lut[r8] : r8 / 255f;
+        final float g = linear ? lut[g8] : g8 / 255f;
+        final float b = linear ? lut[b8] : b8 / 255f;
+        final float tr = clamp(m[0] * r + m[4] * g + m[8] * b + m[12], 0f, 1f);
+        final float tg = clamp(m[1] * r + m[5] * g + m[9] * b + m[13], 0f, 1f);
+        final float tb = clamp(m[2] * r + m[6] * g + m[10] * b + m[14], 0f, 1f);
+        mSumR += linear ? tr : lut[Math.round(tr * 255f)];
+        mSumG += linear ? tg : lut[Math.round(tg * 255f)];
+        mSumB += linear ? tb : lut[Math.round(tb * 255f)];
+    }
+
+    /**
+     * SurfaceFlinger applies the display color transform (night light, color inversion, extra
+     * dim, saturation and so on) to the panel but renders screenshots without it. Rebuild it,
+     * so that the sampled pixels are the ones the panel emits: with inverted colors the
+     * screenshot of a white screen is white while the panel is black. Capture worker only.
+     *
+     * The transform is SurfaceFlinger's client matrix (everything DisplayTransformManager
+     * holds, composed in ascending level order) times its global saturation matrix. Not
+     * covered: the daltonizer of the color-correction accessibility modes, which is known
+     * only inside SurfaceFlinger and leaves neutral colors unchanged.
+     */
+    private void updateColorTransform() {
+        float[] transform = null;
+        boolean linear = true;
+        try {
+            final DisplayTransformManager dtm =
+                    LocalServices.getService(DisplayTransformManager.class);
+            if (dtm != null) {
+                linear = dtm.needsLinearColorMatrix();
+                for (int level = 0; level < COLOR_MATRIX_LEVEL_LIMIT; level++) {
+                    final float[] matrix = dtm.getColorMatrix(level);
+                    if (matrix != null && matrix.length == 16) {
+                        transform = multiply(transform, matrix);
+                    }
+                }
+            }
+            final float saturation = Math.max(0f, getFloatProp(PARTS_SATURATION_PROP,
+                    getFloatProp(SF_SATURATION_PROP, 1f)));
+            if (saturation != 1f) {
+                // SurfaceFlinger::calculateColorMatrix()
+                final float lr = 0.213f * (1f - saturation);
+                final float lg = 0.715f * (1f - saturation);
+                final float lb = 0.072f * (1f - saturation);
+                final float[] s = mSaturationMatrix;
+                Matrix.setIdentityM(s, 0);
+                s[0] = lr + saturation;
+                s[1] = lr;
+                s[2] = lr;
+                s[4] = lg;
+                s[5] = lg + saturation;
+                s[6] = lg;
+                s[8] = lb;
+                s[9] = lb;
+                s[10] = lb + saturation;
+                transform = multiply(transform, s);
+            }
+        } catch (RuntimeException | LinkageError e) {
+            // An unreadable transform must not stop the correction of ordinary content.
+            if (!mColorTransformFailedLogged) {
+                mColorTransformFailedLogged = true;
+                Slog.w(TAG, "display color transform unavailable, assuming none", e);
+            }
+            transform = null;
+        }
+        mColorTransform = isUsableTransform(transform) ? transform : null;
+        mColorTransformLinear = linear;
+    }
+
+    /** lhs * rhs into one of two scratch matrices; a null lhs stands for identity. */
+    private float[] multiply(float[] lhs, float[] rhs) {
+        if (lhs == null) {
+            System.arraycopy(rhs, 0, mMatrixA, 0, 16);
+            return mMatrixA;
+        }
+        final float[] result = lhs == mMatrixA ? mMatrixB : mMatrixA;
+        Matrix.multiplyMM(result, 0, lhs, 0, rhs, 0);
+        return result;
+    }
+
+    /** False for no transform, a broken one, or one that changes nothing visible. */
+    private static boolean isUsableTransform(float[] m) {
+        if (m == null) {
+            return false;
+        }
+        boolean identity = true;
+        // Only the three color rows and the offset column are applied.
+        for (int i = 0; i < 16; i++) {
+            if (i % 4 == 3) {
+                continue;
+            }
+            if (!Float.isFinite(m[i])) {
+                return false;
+            }
+            if (Math.abs(m[i] - (i == 0 || i == 5 || i == 10 ? 1f : 0f)) > 0.005f) {
+                identity = false;
+            }
+        }
+        return !identity;
+    }
+
     /** Current panel DBV normalized to 0..1, or -1 if it cannot be read reliably. */
-    private float getBacklightNorm() {
-        final float cur = readSysfsFloat(BACKLIGHT_PATH, mAlsSysfsBuf);
+    private float getBacklightNorm(byte[] sysfsBuf) {
+        final float cur = readSysfsFloat(BACKLIGHT_PATH, sysfsBuf);
         if (cur <= 0f) {
             return cur;
         }
-        if (mMaxBacklight <= 0f) {
-            mMaxBacklight = readSysfsFloat(MAX_BACKLIGHT_PATH, mAlsSysfsBuf);
+        float max = mMaxBacklight;
+        if (max <= 0f) {
+            max = readSysfsFloat(MAX_BACKLIGHT_PATH, sysfsBuf);
+            mMaxBacklight = max;
         }
-        return mMaxBacklight > 0f ? Math.min(1f, cur / mMaxBacklight) : -1f;
+        return max > 0f ? Math.min(1f, cur / max) : -1f;
     }
 
     private static float readSysfsFloat(String path, byte[] buf) {
@@ -868,7 +1188,12 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                     + ", captures=" + mCaptureAttempts + ", successes=" + mCaptureSuccesses
                     + ", failures=" + mCaptureFailures + ", discarded=" + mDiscardedCaptures
                     + ", expired=" + mExpiredSamples
+                    + ", colorTransform=" + mColorTransformApplied
+                    + ", runLeakage=" + (mRunStartElapsed < 0 ? Float.NaN : mRunLeakage)
+                    + ", runAgeMs=" + ageMs(now, mRunStartElapsed)
                     + ", alsSamples=" + mAlsSamples
+                    + ", reevaluateRequests=" + mReevaluateRequests
+                    + ", reevaluated=" + mReevaluatedSamples
                     + ", cacheMisses=" + mCacheMisses
                     + ", lastAlsAgeMs=" + ageMs(now, mLastAlsElapsed)
                     + ", lastRawLux=" + mLastRawLux + ", lastCorrectedLux=" + mLastCorrectedLux
