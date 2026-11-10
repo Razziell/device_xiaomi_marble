@@ -65,8 +65,9 @@ only implement `DoubleUnaryOperator` remain supported without lifecycle notifica
 
 All calibration parameters are persistent system properties and are read at runtime.
 They do not require a reboot or framework restart. A changed value normally takes effect
-on the next ALS event or periodic framebuffer refresh. When correction is disabled but ALS
-is still enabled, a lightweight worker check detects re-enabling without needing a new ALS event.
+on the next ALS event or periodic framebuffer refresh. The exception is re-enabling: a
+disabled corrector does not poll, so it resumes only when `system_server` is told that a
+property changed (XiaomiParts does this, see below) or when the next ALS event arrives.
 
 | Property | Default | Clamped to | Meaning |
 |---|---:|---:|---|
@@ -107,7 +108,8 @@ sys.als_correction.state
 An empty value means fresh correction data is not available yet: before the first capture,
 after cache expiry or a very slow capture, or when DBV cannot be read. It does not indicate
 a capture failure. Lifecycle and refresh callbacks update the state; changes to persistent
-settings are observed on the next ALS event or refresh. The state is not a display-power API.
+settings are observed on the next ALS event, refresh or property-change notification. The
+state is not a display-power API.
 Normal successful periodic captures keep `active` even if TYPE_LIGHT remains unchanged.
 
 The implementation class is selected at boot by the read-only product property:
@@ -124,9 +126,13 @@ On a rooted user build:
 # Inspect current overrides (an empty result means that the compiled default is used)
 adb shell su -c 'getprop | grep als_correction'
 
-# Disable/enable the correction immediately
+# Disable the correction (seen by the next refresh, at most one interval later)
 adb shell su -c 'setprop persist.sys.als_correction.enabled false'
+
+# Enable it again. setprop alone is picked up only by the next ALS event, so also tell
+# system_server that a property changed (SYSPROPS_TRANSACTION, as XiaomiParts does)
 adb shell su -c 'setprop persist.sys.als_correction.enabled true'
+adb shell su -c 'service call display 1599295570'
 
 # Make correction stronger or weaker
 adb shell su -c 'setprop persist.sys.als_correction.k 700'
@@ -159,6 +165,9 @@ unprivileged applications and shell users cannot normally change `persist.sys.*`
 * Increase `ref_luma` if status-bar icons or a dark UI are being over-corrected.
 * Do not change `cx`, `cy` or `r` unless panel coordinates or the sampled sensor area are known
   to be wrong.
+* The default `k` of 550 is a chosen value, not a measured one. White/black measurements at
+  DBV 250/500/1000/2000 give `k` = 625..656, so the default leaves about 12-16% of the
+  white-content leakage uncorrected. Use about 640 to match those measurements.
 * Change one parameter at a time under stable external lighting and compare white/dark content
   at the same fixed DBV.
 
@@ -177,7 +186,9 @@ increases blue correction without changing the number or frequency of screen cap
 
 The dark-UI baseline (`ref_luma`) is subtracted per linearized primary before spectral
 weighting, and only pixels inside the inscribed circular sensor disc of the `16 x 16` sample
-grid are averaged (using a cached 256-entry gamma LUT). Because the RGB weights sum to 1,
+grid are averaged (using a cached 256-entry gamma LUT). If `cx`, `cy` and `r` put part of the
+disc outside the panel, the capture is cut off at the edge and the mask follows the real disc
+position inside that smaller capture. Because the RGB weights sum to 1,
 neutral white/gray content and dark UIs where all primaries are below `ref_luma` behave
 identically to a post-sum threshold, while saturated blue (`#0000FF`) and red (`#FF0000`)
 content above the sensor are compensated proportionally to their measured TCS3701 response.
@@ -209,9 +220,10 @@ Captures have a hard maximum age of **2000 ms**, measured from the start of capt
 an update, and a capture taking 2000 ms or longer is not accepted as fresh data. Expiry is
 also published independently of both ALS delivery and the capture worker. With intervals above
 2000 ms there can deliberately be gaps with no usable correction data; the recommended UI
-intervals are 250/500 ms (Fast/Balanced). XiaomiParts migrates the retired 1000 ms preset to 500 ms at boot or when reading a UI
-snapshot, persisting the new value. Other custom intervals remain effective and are shown as
-custom values until a preset or reset is selected. ADB-set 1000 ms is also migrated.
+intervals are 250/500 ms (Fast/Balanced). XiaomiParts migrates the retired 1000 ms preset to
+500 ms at boot and once each time its settings screen is opened, persisting the new value.
+Other custom intervals remain effective and are shown as custom values until a preset or reset
+is selected. An ADB-set 1000 ms is migrated at those same two points.
 
 ### Refresh independent of on-change ALS
 
@@ -229,7 +241,11 @@ The next real ALS event consumes the latest fresh content with the current DBV.
 OFF/doze, unavailable DBV and capture failures use a retry delay of
 `max(interval_ms, 1000)` ms. Disabled correction (`enabled=false`) stops the background
 refresh timer completely (zero periodic wakeups) and resumes immediately on a sysprop change
-notification from XiaomiParts or on the next ALS event.
+notification from XiaomiParts or on the next ALS event. `SystemProperties.reportSyspropChanged()`
+only reaches callbacks inside the calling process, so XiaomiParts sends `SYSPROPS_TRANSACTION`
+to the `display` service binder after writing the enable property; that runs the change
+callbacks inside `system_server`. A plain `setprop` sends nothing, and the ALS event that
+finally wakes the corrector is itself passed through uncorrected.
 When the ALS listener is disabled, **all queued refreshes are cancelled**: no polling,
 capture or wake lock is kept for an inactive listener. An already running capture cannot
 be cancelled, but its old-generation result is discarded. Re-enabling during that capture
@@ -300,6 +316,11 @@ Important fields:
 * `lastCaptureAgeMs`, `lastCaptureDurationMs`: time since completion and processing duration
   of the last attempted capture, including its availability checks.
 * `alsSamples`, `lastAlsAgeMs`, `lastRawLux`, `lastCorrectedLux`: actual sensor callbacks.
+* `cacheMisses`: sensor callbacks passed through uncorrected only because no fresh content was
+  cached (correction enabled, listener active, DBV readable). TYPE_LIGHT is on-change, so such
+  a lux value stays in effect until the sensor reports again. An occasional miss right after
+  the listener is enabled is expected; a count that keeps growing while the screen stays on
+  is not.
 * `lastUsedCacheAgeMs`: age of content used for the last ALS callback; -1 means passthrough
   without a usable sample. A valid sample can still subtract zero below the reference threshold.
 

@@ -65,6 +65,7 @@ import com.android.internal.os.BackgroundThread;
 import com.android.server.LocalServices;
 
 import java.io.FileInputStream;
+import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.util.function.Consumer;
 import java.util.function.DoubleUnaryOperator;
@@ -88,7 +89,11 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
      */
     // Measured on the connected marble across DBV 250/500/1000/2000:
     // delta(white-black) = 21.96/43.63/88.41/184.61 lux. Together with the measured
-    // framebuffer delta-luma=0.5763 this gives k=625..656; use the rounded mean.
+    // framebuffer delta-luma=0.5763 this gives k=625..656.
+    // The shipped default is deliberately lower than that. It is a chosen value, not a
+    // measured one: by the numbers above it leaves about 12-16% of the white-content leakage
+    // uncorrected (155 instead of 185 lux at DBV 2000). Set persist.sys.als_correction.k to
+    // about 640 for a correction that matches the measurements.
     private static final int DEF_K = 550;
 
     // Settings in dark mode is not pixel-black around the sensor because of status-bar icons.
@@ -190,6 +195,8 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     private long mDiscardedCaptures;
     private long mExpiredSamples;
     private long mAlsSamples;
+    // ALS events that passed through uncorrected only because no fresh content was cached.
+    private long mCacheMisses;
     private long mLastAlsElapsed = -1;
     private float mLastRawLux = Float.NaN;
     private float mLastCorrectedLux = Float.NaN;
@@ -203,6 +210,13 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     private final float[] mRgbScratch = new float[3];
     private final float[] mGammaLut = new float[256];
     private float mCachedGamma = Float.NaN;
+    // Sensor disc inside the last capture crop, as fractions of the crop size. They differ from
+    // the inscribed circle only when the crop was cut off by a panel edge.
+    private boolean mDiscClipped;
+    private float mDiscCenterX = 0.5f;
+    private float mDiscCenterY = 0.5f;
+    private float mDiscRadiusX = 0.5f;
+    private float mDiscRadiusY = 0.5f;
     private IBinder mDisplayToken;
     private boolean mCaptureFailedLogged;
     private String mRequestedState;
@@ -217,12 +231,39 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
     };
 
     public MarbleAlsCorrection() {
-        SystemProperties.addChangeCallback(this::onSyspropChanged);
+        SystemProperties.addChangeCallback(new SyspropCallback(this));
     }
 
+    /**
+     * AutomaticBrightnessController is recreated on display configuration changes and there is
+     * no teardown hook, while SystemProperties keeps its callbacks forever. Hold the corrector
+     * weakly and unregister once it is gone, so replaced instances can be collected.
+     */
+    private static final class SyspropCallback implements Runnable {
+        private final WeakReference<MarbleAlsCorrection> mCorrection;
+
+        SyspropCallback(MarbleAlsCorrection correction) {
+            mCorrection = new WeakReference<>(correction);
+        }
+
+        @Override
+        public void run() {
+            final MarbleAlsCorrection correction = mCorrection.get();
+            if (correction == null) {
+                // Safe during dispatch: SystemProperties iterates over a copy of the list.
+                SystemProperties.removeChangeCallback(this);
+            } else {
+                correction.onSyspropChanged();
+            }
+        }
+    }
+
+    /** Runs on a binder thread when a client reports a property change to system_server. */
     private void onSyspropChanged() {
         synchronized (mLock) {
             if (!mLightSensorEnabled) {
+                // No capture without the ALS listener; only keep the published state truthful.
+                publishStateLocked(isCorrectionEnabled() ? STATE_IDLE : STATE_OFF);
                 return;
             }
             if (!isCorrectionEnabled()) {
@@ -323,9 +364,12 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             bNorm = mLastBlueNorm;
             if (lumaNorm >= 0f) {
                 mLastUsedCacheAgeMs = now - mLastLumaElapsed;
-            } else if (!mCapturePending && !mRefreshScheduled) {
-                // Recover if enabled via adb setprop without reportSyspropChanged().
-                scheduleRefreshLocked(0);
+            } else {
+                mCacheMisses++;
+                if (!mCapturePending && !mRefreshScheduled) {
+                    // Recover if enabled via adb setprop, which does not notify system_server.
+                    scheduleRefreshLocked(0);
+                }
             }
         }
         if (lumaNorm < 0f) {
@@ -540,7 +584,8 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 SystemProperties.getInt("persist.sys.als_correction.cy", DEF_CENTER_Y),
                 0, PANEL_HEIGHT - 1);
 
-        final Rect crop = new Rect(cx - r, cy - r, cx + r, cy + r);
+        final Rect disc = new Rect(cx - r, cy - r, cx + r, cy + r);
+        final Rect crop = new Rect(disc);
         if (crop.left < 0) crop.left = 0;
         if (crop.top < 0) crop.top = 0;
         if (crop.right > PANEL_WIDTH) crop.right = PANEL_WIDTH;
@@ -557,7 +602,16 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
             final int rotation = getDisplayRotation();
             if (rotation != Surface.ROTATION_0) {
                 RotationUtils.rotateBounds(crop, PANEL_WIDTH, PANEL_HEIGHT, rotation);
+                RotationUtils.rotateBounds(disc, PANEL_WIDTH, PANEL_HEIGHT, rotation);
             }
+
+            // A crop cut off by a panel edge is no longer centered on the sensor. Tell
+            // averageRgb() where the disc really is instead of assuming the inscribed circle.
+            mDiscClipped = !crop.equals(disc);
+            mDiscCenterX = (disc.exactCenterX() - crop.left) / crop.width();
+            mDiscCenterY = (disc.exactCenterY() - crop.top) / crop.height();
+            mDiscRadiusX = (float) r / crop.width();
+            mDiscRadiusY = (float) r / crop.height();
 
             final float scale = (float) SAMPLE_EDGE / Math.max(crop.width(), crop.height());
 
@@ -674,7 +728,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 getFloatProp("persist.sys.als_correction.gamma", DEF_GAMMA),
                 GAMMA_MIN, GAMMA_MAX);
         final float[] lut = getGammaLut(gamma);
-        final boolean useStaticMask = (w == SAMPLE_EDGE && h == SAMPLE_EDGE);
+        final boolean useStaticMask = !mDiscClipped && w == SAMPLE_EDGE && h == SAMPLE_EDGE;
 
         double sumR = 0;
         double sumG = 0;
@@ -693,13 +747,16 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                 samples++;
             }
         } else {
+            // Pixel centers as fractions of the crop, relative to the disc set by the capture.
             final float invW = 1f / w;
             final float invH = 1f / h;
+            final float invRadiusX = 1f / mDiscRadiusX;
+            final float invRadiusY = 1f / mDiscRadiusY;
             for (int y = 0; y < h; y++) {
-                final float dy = (y + 0.5f) * invH - 0.5f;
+                final float dy = ((y + 0.5f) * invH - mDiscCenterY) * invRadiusY;
                 for (int x = 0; x < w; x++) {
-                    final float dx = (x + 0.5f) * invW - 0.5f;
-                    if (dx * dx + dy * dy > 0.25f) {
+                    final float dx = ((x + 0.5f) * invW - mDiscCenterX) * invRadiusX;
+                    if (dx * dx + dy * dy > 1f) {
                         continue;
                     }
                     final int px = pixels[y * w + x];
@@ -812,6 +869,7 @@ public final class MarbleAlsCorrection implements DoubleUnaryOperator, Consumer<
                     + ", failures=" + mCaptureFailures + ", discarded=" + mDiscardedCaptures
                     + ", expired=" + mExpiredSamples
                     + ", alsSamples=" + mAlsSamples
+                    + ", cacheMisses=" + mCacheMisses
                     + ", lastAlsAgeMs=" + ageMs(now, mLastAlsElapsed)
                     + ", lastRawLux=" + mLastRawLux + ", lastCorrectedLux=" + mLastCorrectedLux
                     + ", lastUsedCacheAgeMs=" + mLastUsedCacheAgeMs
