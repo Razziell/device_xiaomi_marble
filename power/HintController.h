@@ -16,6 +16,7 @@
 #include <thread>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -35,7 +36,21 @@ struct InteractionConfig {
     int64_t minMs = 300;
     int64_t maxMs = 1500;
     int64_t offsetMs = 0;
+    // Both extras are off unless the product enables them.
+    // INTERACTION vote started by a real screen-off -> screen-on transition.
+    int64_t wakeBoostMs = 0;
+    // Advertise Boost::DISPLAY_UPDATE_IMMINENT. Clients cache the answer, so
+    // this is fixed for the lifetime of the service.
+    bool displayUpdateBoost = false;
+    // Boost only a display update that follows this long without any request
+    // (see DisplayUpdatePolicy.h); 0 boosts every request.
+    int64_t displayUpdateQuietMs = 1200;
 };
+
+// SurfaceFlinger sends DISPLAY_UPDATE_IMMINENT on the first update after 80ms
+// without one. The vote only has to cover that first frame.
+inline constexpr auto kDisplayUpdateBoost = std::chrono::milliseconds(100);
+inline constexpr const char* kDisplayUpdateHint = "DISPLAY_UPDATE_IMMINENT";
 
 class HintController {
   public:
@@ -68,6 +83,9 @@ class HintController {
     void startTimerLocked();
     bool cancelTransientLocked();
     bool boostsBlockedLocked() const;
+    bool saverLocked() const;
+    bool setDisplayUpdateBoostLocked(int32_t durationMs);
+    void startWakeBoostLocked();
     bool wantedLocked(const std::string& name) const;
     bool reconcilePerfLocked();
     void expirePerfLocked();
@@ -91,6 +109,15 @@ class HintController {
     std::chrono::steady_clock::time_point mInteractionDeadline{};
     uint64_t mInteractionEnqueued = 0;
     uint64_t mInteractionCoalesced = 0;
+    uint64_t mWakeBoosts = 0;
+    uint64_t mDisplayUpdateEnqueued = 0;
+    uint64_t mDisplayUpdateQuietSkipped = 0;
+    uint64_t mDisplayUpdateSkipped = 0;
+    // Last request of any outcome, not the last boost.
+    std::optional<std::chrono::steady_clock::time_point> mDisplayUpdateRequest;
+    // A finite hint (see kTransientHints) may hold a vote not cancelled yet.
+    // Initially true: the first blocking mode call after startup cancels.
+    bool mTransientMayBeActive = true;
 
     struct PerfLock {
         uint64_t owner;

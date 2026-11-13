@@ -829,6 +829,7 @@
             "Value": "580000000"
         },
         {
+            "_comment": "TODO: the Flipendo profile (5 actions and the PowerHALFlipendoState node) needs further work. Nothing requests this mode in this ROM: Extreme Battery Saver (com.google.android.flipendo) drives the framework battery saver, so the HAL only receives LOW_POWER. Add a trigger for the tighter caps or remove the profile. Kept unchanged for now.",
             "PowerHint": "Flipendo",
             "Node": "CPULittleClusterMaxFreq",
             "Duration": 0,
@@ -1013,6 +1014,60 @@
             "Node": "CPUBigClusterMinFreq",
             "Duration": 500,
             "Value": "1324800"
+        },
+        {
+            "PowerHint": "GAME",
+            "Node": "UclampTALatency",
+            "Duration": 0,
+            "Value": "1"
+        },
+        {
+            "PowerHint": "GAME",
+            "Node": "GPUMinFreq",
+            "Duration": 0,
+            "Value": "285000000"
+        },
+        {
+            "PowerHint": "GAME_LOADING",
+            "Node": "CPULittleClusterMinFreq",
+            "Duration": 5000,
+            "Value": "1324800"
+        },
+        {
+            "PowerHint": "GAME_LOADING",
+            "Node": "CPUBigClusterMinFreq",
+            "Duration": 5000,
+            "Value": "1555200"
+        },
+        {
+            "PowerHint": "GAME_LOADING",
+            "Node": "CPUBWMinFreq",
+            "Duration": 5000,
+            "Value": "1555000"
+        },
+        {
+            "PowerHint": "GAME_LOADING",
+            "Node": "LLCCBWMinFreq",
+            "Duration": 5000,
+            "Value": "806000"
+        },
+        {
+            "PowerHint": "GAME_LOADING",
+            "Node": "L3MinFreq",
+            "Duration": 5000,
+            "Value": "998400"
+        },
+        {
+            "PowerHint": "DISPLAY_UPDATE_IMMINENT",
+            "Node": "CPULittleClusterMinFreq",
+            "Duration": 100,
+            "Value": "1132800"
+        },
+        {
+            "PowerHint": "DISPLAY_UPDATE_IMMINENT",
+            "Node": "UclampTALatency",
+            "Duration": 100,
+            "Value": "1"
         }
     ]
 }

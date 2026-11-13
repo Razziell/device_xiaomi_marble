@@ -37,6 +37,13 @@ PRODUCT_VENDOR_PROPERTIES += \
     vendor.powerhal.interaction.offset=0 \
     vendor.powerhal.perf.enabled=true
 
+# Boost on screen-on (wake_boost_ms) and on the first frame after
+# display_update_quiet_ms without updates. 0 / false disable them.
+PRODUCT_VENDOR_PROPERTIES += \
+    vendor.powerhal.wake_boost_ms=400 \
+    vendor.powerhal.display_update_boost=true \
+    vendor.powerhal.display_update_quiet_ms=1200
+
 # Device-tested Goodix (including screen-off) and CHI open/close; snapshot unverified.
 PRODUCT_VENDOR_PROPERTIES += \
     vendor.powerhal.perf.goodix.enabled=true \

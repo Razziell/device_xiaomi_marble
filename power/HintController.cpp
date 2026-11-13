@@ -3,24 +3,32 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "HintController.h"
+#include "DisplayUpdatePolicy.h"
 #include "InteractionPolicy.h"
 
 #include <algorithm>
 #include <array>
 #include <sstream>
 #include <string_view>
+#include <utility>
 
 namespace marble::power {
 namespace {
-constexpr std::array<std::string_view, 7> kModes = {
+constexpr std::array<std::string_view, 9> kModes = {
         "INTERACTIVE", "LOW_POWER", "SUSTAINED_PERFORMANCE", "FIXED_PERFORMANCE",
-        "EXPENSIVE_RENDERING", "LAUNCH", "Flipendo"};
+        "EXPENSIVE_RENDERING", "LAUNCH", "Flipendo", "GAME", "GAME_LOADING"};
+// Finite hints started by this controller and cancelled together whenever a
+// mode blocks boosts. They are never persisted or replayed.
+constexpr std::array<const char*, 4> kTransientHints = {
+        "INTERACTION", "LAUNCH", "GAME_LOADING", kDisplayUpdateHint};
 
 InteractionConfig normalize(InteractionConfig config) {
     // Bound properties too: no malformed override can create an indefinite boost.
     config.maxMs = std::clamp<int64_t>(config.maxMs, 1, 10000);
     config.minMs = std::clamp<int64_t>(config.minMs, 1, config.maxMs);
     config.offsetMs = std::clamp<int64_t>(config.offsetMs, 0, 10000);
+    config.wakeBoostMs = std::clamp<int64_t>(config.wakeBoostMs, 0, config.maxMs);
+    config.displayUpdateQuietMs = std::clamp<int64_t>(config.displayUpdateQuietMs, 0, 60000);
     return config;
 }
 }  // namespace
@@ -70,6 +78,7 @@ bool HintController::supportsMode(const std::string& name) const {
 }
 
 bool HintController::supportsBoost(const std::string& name) const {
+    if (name == kDisplayUpdateHint) return mConfig.displayUpdateBoost && mBackend.supports(name);
     // The shipped configuration defines no other standard boost.
     return name == "INTERACTION" && mBackend.supports(name);
 }
@@ -83,15 +92,23 @@ int64_t HintController::interactionDurationMs(int32_t durationMs, InteractionCon
 
 bool HintController::wantedLocked(const std::string& name) const {
     if (!mRequested.contains(name)) return false;
-    const bool saver = mRequested.contains("LOW_POWER") || mRequested.contains("Flipendo");
+    const bool saver = saverLocked();
+    // Frequency floors are for a lit screen. A request left enabled across
+    // screen-off stays requested (and persisted) and resumes on wake, exactly
+    // like a request masked by a saver; an unknown screen state masks nothing.
+    const bool screenOff = mInteractiveKnown && !mRequested.contains("INTERACTIVE");
     if (name == "FIXED_PERFORMANCE") {
-        return !saver && !mRequested.contains("SUSTAINED_PERFORMANCE");
+        return !saver && !screenOff && !mRequested.contains("SUSTAINED_PERFORMANCE");
     }
-    if (name == "SUSTAINED_PERFORMANCE") return !saver;
-    if (name == "EXPENSIVE_RENDERING") {
-        return !saver && (!mInteractiveKnown || mRequested.contains("INTERACTIVE"));
+    // GAME is requested for as long as a game is the foreground app.
+    if (name == "SUSTAINED_PERFORMANCE" || name == "EXPENSIVE_RENDERING" || name == "GAME") {
+        return !saver && !screenOff;
     }
     return true;
+}
+
+bool HintController::saverLocked() const {
+    return mRequested.contains("LOW_POWER") || mRequested.contains("Flipendo");
 }
 
 bool HintController::boostsBlockedLocked() const {
@@ -101,10 +118,18 @@ bool HintController::boostsBlockedLocked() const {
 
 bool HintController::cancelTransientLocked() {
     bool ok = clearPerfLocked();
-    // Cancel both on mode transitions, even if the timer already expired. Never
-    // replay LAUNCH/INTERACTION when a blocking mode is subsequently released.
-    for (const auto* name : {"INTERACTION", "LAUNCH"}) {
-        if (mBackend.supports(name)) ok = mBackend.end(name) && ok;
+    // Cancel them on mode transitions, even if the timer already expired. Never
+    // replay a finite hint when a blocking mode is subsequently released.
+    // Only this controller starts them, so once all cancellations have been
+    // enqueued there is nothing left to cancel until one is started again:
+    // repeated blocking mode calls then add no jobs to the shared queue.
+    if (mTransientMayBeActive) {
+        bool ended = true;
+        for (const auto* name : kTransientHints) {
+            if (mBackend.supports(name)) ended = mBackend.end(name) && ended;
+        }
+        if (ended) mTransientMayBeActive = false;
+        ok = ended && ok;
     }
     mInteractionDeadline = {};
     return ok;
@@ -151,12 +176,20 @@ void HintController::noteModeFailureLocked(bool reconciled) {
 bool HintController::setMode(const std::string& name, bool enabled) {
     if (!supportsMode(name)) return false;
     std::lock_guard lock(mMutex);
-    if (name == "LAUNCH") {
+    if (name == "LAUNCH" || name == "GAME_LOADING") {
         if (!enabled) return mBackend.end(name);
         if (boostsBlockedLocked()) return true;
+        // The framework drops LAUNCH itself while battery saver is on; a game
+        // loading boost gets the same treatment here.
+        if (name == "GAME_LOADING" && saverLocked()) return true;
+        mTransientMayBeActive = true;
         return mBackend.start(name);  // Per-node JSON timeouts; each call renews.
     }
 
+    // Only a real screen-off -> screen-on transition: not the first report
+    // after boot and not a duplicate callback.
+    const bool wake = name == "INTERACTIVE" && enabled && mInteractiveKnown &&
+                      !mRequested.contains("INTERACTIVE");
     if (name == "INTERACTIVE") {
         // Duplicate screen-off callbacks must not refill the global duty budget.
         if (!enabled && (!mInteractiveKnown || mRequested.contains("INTERACTIVE"))) {
@@ -171,13 +204,25 @@ bool HintController::setMode(const std::string& name, bool enabled) {
     // A property failure is reported, but must not prevent safety cancellations.
     const bool saved = saveModesLocked();
 
+    // Enqueued before the screen-off fingerprint lease is cancelled below, so
+    // the floors both of them request are not dropped in between.
+    if (wake) startWakeBoostLocked();
+    // A saver that was just enabled ends a running game loading boost; one
+    // enabled earlier already keeps it from starting.
+    if (enabled && (name == "LOW_POWER" || name == "Flipendo") &&
+        mBackend.supports("GAME_LOADING") && !mBackend.end("GAME_LOADING")) {
+        noteModeFailureLocked(false);
+        return false;
+    }
+
     // Never promote/replay a screen-off lease on wake. Requested sustained
     // cancels it even when LOW_POWER masks the effective sustained mode.
     if (((name == "INTERACTIVE" && enabled) ||
          mRequested.contains("SUSTAINED_PERFORMANCE")) &&
         !cancelGoodixScreenOffLocked()) return false;
-    // Conservatively keep the existing cancellation on any blocking mode call,
-    // including duplicate screen-off. Cancellation does not refund the budget.
+    // Every blocking mode call, including duplicate screen-off, drops perf
+    // leases and cancels the finite hints unless that cancellation is already
+    // enqueued and nothing was started since. It does not refund the budget.
     if (boostsBlockedLocked() && !cancelTransientLocked()) {
         noteModeFailureLocked(false);
         return false;
@@ -191,6 +236,7 @@ bool HintController::setBoost(const std::string& name, int32_t durationMs) {
     if (!supportsBoost(name)) return false;
     std::lock_guard lock(mMutex);
     if (mModeRetryPending > 0 && reconcileLocked()) mModeRetryPending = 0;
+    if (name == kDisplayUpdateHint) return setDisplayUpdateBoostLocked(durationMs);
     if (durationMs < 0) {
         const bool ok = mBackend.end(name);
         if (ok) mInteractionDeadline = {};
@@ -207,10 +253,51 @@ bool HintController::setBoost(const std::string& name, int32_t durationMs) {
         ++mInteractionCoalesced;
         return true;
     }
+    mTransientMayBeActive = true;
     if (!mBackend.startFor(name, duration)) return false;
     ++mInteractionEnqueued;
     mInteractionDeadline = deadline;
     return true;
+}
+
+bool HintController::setDisplayUpdateBoostLocked(int32_t durationMs) {
+    if (durationMs < 0) return mBackend.end(kDisplayUpdateHint);
+    const auto now = std::chrono::steady_clock::now();
+    const auto previousRequest = std::exchange(mDisplayUpdateRequest, now);
+    // Not a failure for the caller: the request is dropped by policy. Battery
+    // saver gets no extra wakeups from display updates.
+    if (boostsBlockedLocked() || saverLocked()) {
+        ++mDisplayUpdateSkipped;
+        return true;
+    }
+    if (!displayUpdateAfterQuiet(now, previousRequest,
+                                 std::chrono::milliseconds(mConfig.displayUpdateQuietMs))) {
+        ++mDisplayUpdateQuietSkipped;
+        return true;
+    }
+    // An INTERACTION vote that outlasts this one already requests more.
+    if (mInteractionDeadline >= now + kDisplayUpdateBoost) {
+        ++mDisplayUpdateSkipped;
+        return true;
+    }
+    mTransientMayBeActive = true;
+    // The caller's duration (always 0 from SurfaceFlinger) is not used.
+    if (!mBackend.startFor(kDisplayUpdateHint, kDisplayUpdateBoost)) return false;
+    ++mDisplayUpdateEnqueued;
+    return true;
+}
+
+void HintController::startWakeBoostLocked() {
+    if (mConfig.wakeBoostMs <= 0 || !mBackend.supports("INTERACTION")) return;
+    if (boostsBlockedLocked()) return;
+    const auto duration = std::chrono::milliseconds(mConfig.wakeBoostMs);
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    if (deadline <= mInteractionDeadline) return;
+    mTransientMayBeActive = true;
+    // Best effort: a failed enqueue must not fail the screen-on mode call.
+    if (!mBackend.startFor("INTERACTION", duration)) return;
+    ++mWakeBoosts;
+    mInteractionDeadline = deadline;
 }
 
 std::string HintController::dump() const {
@@ -227,6 +314,11 @@ std::string HintController::dump() const {
     out << "\nInteraction requested remaining ms: " << std::max<int64_t>(0, remaining)
         << "\nInteraction enqueued/coalesced: " << mInteractionEnqueued
         << '/' << mInteractionCoalesced
+        << "\nWake boost ms/started: " << mConfig.wakeBoostMs << '/' << mWakeBoosts
+        << "\nDisplay-update boost enabled/quiet ms: " << mConfig.displayUpdateBoost << '/'
+        << mConfig.displayUpdateQuietMs << ", enqueued/not-quiet/other-skipped: "
+        << mDisplayUpdateEnqueued << '/' << mDisplayUpdateQuietSkipped << '/'
+        << mDisplayUpdateSkipped
         << "\nRequested-mode save failures: " << mModeSaveFailures
         << "\nMode reconcile failures/pending retries: " << mModeReconcileFailures
         << '/' << mModeRetryPending

@@ -66,6 +66,11 @@ int main() {
             .minMs = ::android::base::GetIntProperty<int64_t>("vendor.powerhal.interaction.min", 300),
             .maxMs = ::android::base::GetIntProperty<int64_t>("vendor.powerhal.interaction.max", 1500),
             .offsetMs = ::android::base::GetIntProperty<int64_t>("vendor.powerhal.interaction.offset", 0),
+            .wakeBoostMs = ::android::base::GetIntProperty<int64_t>("vendor.powerhal.wake_boost_ms", 0),
+            .displayUpdateBoost =
+                    ::android::base::GetBoolProperty("vendor.powerhal.display_update_boost", false),
+            .displayUpdateQuietMs = ::android::base::GetIntProperty<int64_t>(
+                    "vendor.powerhal.display_update_quiet_ms", 1200),
     };
     PropertyModeStore modeStore;
     auto controller = std::make_shared<marble::power::HintController>(backend, config, &modeStore);
