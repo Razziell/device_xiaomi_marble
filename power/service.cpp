@@ -13,6 +13,7 @@
 #include <perfmgr/HintManager.h>
 #include <processgroup/processgroup.h>
 #include <sched.h>
+#include <signal.h>
 
 #include <thread>
 
@@ -47,6 +48,11 @@ class LibperfmgrBackend final : public marble::power::HintBackend {
 int main() {
     ::android::base::SetDefaultTag("powerhal-marble");
     ::android::base::SetMinimumLogSeverity(::android::base::INFO);
+    // A dump reader that goes away early ("dumpsys ... --raw-backend | head")
+    // must surface as EPIPE, not as a SIGPIPE that makes init restart the HAL:
+    // a restart drops perf sessions and counters, and each framework client
+    // loses its next call to DEAD_OBJECT before it reconnects.
+    signal(SIGPIPE, SIG_IGN);
     auto* hm = HintManager::GetInstance();  // Parse once; start after the init gate.
     CHECK(hm != nullptr);
     CHECK(!hm->IsAdpfSupported()) << "Marble HAL does not implement ADPF; reject incompatible JSON";

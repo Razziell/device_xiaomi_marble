@@ -2,8 +2,14 @@
 #include "DumpWriter.h"
 
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <cstdlib>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <string>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <thread>
 
 namespace marble::power {
@@ -91,6 +97,66 @@ TEST(DumpWriter, InvalidFdOversizedAndNonPipeFailClosed) {
     EXPECT_FALSE(writeBoundedDump(fd, "state"));
     EXPECT_EQ(errno, EOPNOTSUPP);
     close(fd);
+}
+
+// Models the SELinux policy on the device: the HAL may use and write a pipe
+// owned by dumpstate, but getattr (fstat) and open (reopening /proc/self/fd/N)
+// are denied. The writer must work with the descriptor exactly as received.
+TEST(DumpWriter, PipeNeedsNeitherStatNorReopen) {
+    Pipe pipe;
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+#define MARBLE_DENY(nr) \
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 1), \
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES)
+        sock_filter filter[] = {
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+            MARBLE_DENY(SYS_fstat),
+            MARBLE_DENY(SYS_newfstatat),
+            MARBLE_DENY(SYS_statx),
+            MARBLE_DENY(SYS_openat),
+#ifdef SYS_open
+            MARBLE_DENY(SYS_open),
+#endif
+#ifdef SYS_stat
+            MARBLE_DENY(SYS_stat),
+#endif
+#ifdef SYS_openat2
+            MARBLE_DENY(SYS_openat2),
+#endif
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        };
+#undef MARBLE_DENY
+        sock_fprog program{static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])), filter};
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+            prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) != 0) {
+            _exit(77);
+        }
+        _exit(writeBoundedDump(pipe.fds[1], "power-state\n") ? 0 : 1);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    if (WEXITSTATUS(status) == 77) GTEST_SKIP() << "seccomp filters unavailable";
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    char buf[64]{};
+    ASSERT_EQ(read(pipe.fds[0], buf, sizeof(buf)), 12);
+    EXPECT_EQ(std::string(buf, 12), "power-state\n");
+}
+
+TEST(DumpWriter, ClosedReaderReportsEpipeAndLeavesNoPendingSignal) {
+    Pipe pipe;
+    close(pipe.fds[0]); pipe.fds[0] = -1;
+    sigset_t block, old, pending;
+    sigemptyset(&block);
+    sigaddset(&block, SIGPIPE);
+    ASSERT_EQ(pthread_sigmask(SIG_BLOCK, &block, &old), 0);
+    EXPECT_FALSE(writeBoundedDump(pipe.fds[1], "state"));
+    EXPECT_EQ(errno, EPIPE);
+    ASSERT_EQ(sigpending(&pending), 0);
+    EXPECT_EQ(sigismember(&pending, SIGPIPE), 0);
+    ASSERT_EQ(pthread_sigmask(SIG_SETMASK, &old, nullptr), 0);
 }
 
 TEST(DumpWriter, SlowPipeCanDrainWithoutUnboundedWait) {
