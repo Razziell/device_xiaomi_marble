@@ -308,6 +308,9 @@
          -->
     <string name="config_mainBuiltInDisplayCutout" translatable="false">M 0,0 H -28 V 94 H 28 V 0 H 0 Z</string>
 
+    <!-- Default vertical offset (in 0.1 dp units) for the cutout progress ring -->
+    <integer name="config_cutoutProgressRingOffsetYDp10">15</integer>
+
     <!-- An array of arrays of side fingerprint sensor properties relative to each display.
          Note: this value is temporary and is expected to be queried directly
          from the HAL in the future. -->
