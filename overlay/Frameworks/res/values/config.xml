@@ -338,6 +338,10 @@
     <string name="config_pocketJudgeVendorSensorName" translatable="false">xiaomi.sensor.oem_pocket</string>
     <item name="config_pocketJudgeVendorSensorValue" format="float" type="dimen">0.0</item>
 
+    <!-- The vendor classifier only recognises some positions (not seated, not on the edge):
+         also treat "proximity covered and dark" as in pocket. -->
+    <bool name="config_pocketJudgeVendorSensorWithProximity">true</bool>
+
     <!-- Whether device implements proximity sensor based checks to prevent
          accidental unlocks when the screen is off. -->
     <bool name="config_proximityCheckOnFpsUnlock">true</bool>
