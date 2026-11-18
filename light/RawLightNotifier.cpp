@@ -10,9 +10,11 @@
 
 #include <android-base/logging.h>
 #include <android-base/unique_fd.h>
+#include <android-base/scopeguard.h>
 #include <cerrno>
-#include <cstring>
 #include <display/drm/mi_disp.h>
+#include <mutex>
+#include <utils/SystemClock.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <vector>
@@ -42,7 +44,14 @@ namespace {
 
 class RawLightSensorCallback : public IEventQueueCallback {
   public:
-    Return<void> onEvent(const Event& e) {
+    void track(bool active) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        since_ = active ? android::elapsedRealtimeNano() : -1;
+    }
+
+    Return<void> onEvent(const Event& e) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (since_ < 0 || e.timestamp < since_) return Void();
         _oem_msg msg = {};
         msg.notifyType = REPORT_VALUE;
         msg.value = e.u.vec4.y;
@@ -55,49 +64,37 @@ class RawLightSensorCallback : public IEventQueueCallback {
 
         return Void();
     }
+
+  private:
+    std::mutex mutex_;
+    int64_t since_ = -1;
 };
 
 }  // namespace
 
 RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
-    : SensorNotifier(manager), isEnable(false) {
-    initializeSensorQueue(
-            "xiaomi.sensor.ambientlight.factory",
-            false,
-            new RawLightSensorCallback());
-}
+    : SensorNotifier(manager) {}
 
 RawLightNotifier::~RawLightNotifier() {
     deactivate();
 }
 
 void RawLightNotifier::notify() {
-    if (mQueue == nullptr) {
-        LOG(ERROR) << "mQueue is null";
+    sp<RawLightSensorCallback> callback = new RawLightSensorCallback();
+    if (initializeSensorQueue(
+            "xiaomi.sensor.ambientlight.factory",
+            false,
+            callback) != Result::OK) {
         return;
     }
 
     android::base::unique_fd disp_fd_ =
             android::base::unique_fd(
-                    open(kDispFeatureDevice.c_str(), O_RDWR));
+                    open(kDispFeatureDevice.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC));
     if (disp_fd_.get() == -1) {
         PLOG(ERROR) << "failed to open "
                     << kDispFeatureDevice;
         return;
-    }
-
-    // Enable the sensor initially while the display is expected to be on.
-    auto result = mQueue->enableSensor(
-            mSensorHandle,
-            kRawAlsSamplePeriodUs,
-            0 /* latency */);
-    if (!result.isOk()) {
-        LOG(ERROR) << "enableSensor transaction failed: "
-                   << result.description();
-    } else if (result != Result::OK) {
-        LOG(ERROR) << "failed to enable raw light sensor";
-    } else {
-        isEnable = true;
     }
 
     // Boled accepts only BRIGHTNESS and REPORT_VALUE. POWER remains registered
@@ -111,7 +108,7 @@ void RawLightNotifier::notify() {
     // Register for primary display events.
     for (const disp_event_type& event : notifyEvents) {
         disp_event_req req = {};
-        req.base.flag = 0;
+        req.base.flag = event == MI_DISP_EVENT_POWER ? MI_DISP_FLAG_REPLAY_POWER : 0;
         req.base.disp_id = MI_DISP_PRIMARY;
         req.type = event;
 
@@ -120,6 +117,7 @@ void RawLightNotifier::notify() {
                   &req) < 0) {
             PLOG(ERROR) << "failed to register display event "
                         << static_cast<int>(event);
+            return;
         }
     }
 
@@ -136,10 +134,13 @@ void RawLightNotifier::notify() {
             },
     };
 
+    bool isEnable = false;
     _oem_msg msg = {};
     notify_t notifyType;
     float value;
 
+    // Invalidate in-flight callbacks on every exit, including HAL transaction failures.
+    auto closeGate = android::base::make_scope_guard([&] { callback->track(false); });
     while (isActive()) {
         int rc = poll(pollfds, 2, -1);
         if (rc < 0) {
@@ -175,16 +176,16 @@ void RawLightNotifier::notify() {
             continue;
         }
 
-        std::shared_ptr<disp_event_resp> response =
-                parseDispEvent(disp_fd_.get());
-        if (response == nullptr) {
-            continue;
+        auto response = parseDispEvent(disp_fd_.get());
+        if (!response) {
+            break;
         }
 
         if (response->base.type == MI_DISP_EVENT_POWER) {
-            switch (response->data[0]) {
+            switch (response->value) {
                 case MI_DISP_POWER_ON:
                     if (!isEnable) {
+                        callback->track(true);
                         auto enableResult = mQueue->enableSensor(
                                 mSensorHandle,
                                 kRawAlsSamplePeriodUs,
@@ -192,8 +193,10 @@ void RawLightNotifier::notify() {
                         if (!enableResult.isOk()) {
                             LOG(ERROR) << "enableSensor transaction failed: "
                                        << enableResult.description();
+                            return;
                         } else if (enableResult != Result::OK) {
                             LOG(ERROR) << "failed to enable raw light sensor";
+                            return;
                         } else {
                             isEnable = true;
                         }
@@ -202,13 +205,16 @@ void RawLightNotifier::notify() {
 
                 default:
                     if (isEnable) {
+                        callback->track(false);
                         auto disableResult =
                                 mQueue->disableSensor(mSensorHandle);
                         if (!disableResult.isOk()) {
                             LOG(ERROR) << "disableSensor transaction failed: "
                                        << disableResult.description();
+                            return;
                         } else if (disableResult != Result::OK) {
                             LOG(ERROR) << "failed to disable raw light sensor";
+                            return;
                         } else {
                             isEnable = false;
                         }
@@ -221,19 +227,14 @@ void RawLightNotifier::notify() {
             continue;
         } else {
             switch (response->base.type) {
-                case MI_DISP_EVENT_51_BRIGHTNESS: {
-                    uint16_t brightness;
-                    memcpy(&brightness,
-                           response->data,
-                           sizeof(brightness));
+                case MI_DISP_EVENT_51_BRIGHTNESS:
                     notifyType = BRIGHTNESS;
-                    value = brightness;
+                    value = response->value;
                     break;
-                }
 
                 case MI_DISP_EVENT_HBM:
                     notifyType = BRIGHTNESS;
-                    value = response->data[0] ? -1 : -2;
+                    value = response->value ? -1 : -2;
                     break;
 
                 default:
@@ -251,6 +252,7 @@ void RawLightNotifier::notify() {
         SscCalApiWrapper::getInstance().processMsg(&msg);
     }
 
+    callback->track(false);
     if (isEnable) {
         auto disableResult = mQueue->disableSensor(mSensorHandle);
         if (!disableResult.isOk()) {

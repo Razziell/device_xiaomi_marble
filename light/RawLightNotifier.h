@@ -14,7 +14,5 @@ class RawLightNotifier : public SensorNotifier {
     ~RawLightNotifier();
 
   protected:
-    void notify();
-
-    bool isEnable;
+    void notify() override;
 };
