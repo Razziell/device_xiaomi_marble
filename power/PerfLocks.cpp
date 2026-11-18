@@ -88,14 +88,6 @@ bool HintController::clearPerfLocked() {
     return reconcilePerfLocked();
 }
 
-bool HintController::cancelGoodixScreenOffLocked() {
-    std::erase_if(mPerfLocks, [](const auto& item) {
-        return item.second.profile == kGoodixScreenOffProfile;
-    });
-    mPerfCv.notify_all();
-    return reconcilePerfLocked();
-}
-
 int HintController::acquireGoodix(uint64_t owner, int handle, int durationMs,
                                   GoodixAccess access) {
     std::lock_guard lock(mMutex);
@@ -234,6 +226,10 @@ void HintController::startTimerLocked() {
 void HintController::runPerfTimer() {
     std::unique_lock lock(mMutex);
     while (!mPerfStop) {
+        if (mSaveRetryPending > 0) {
+            if (saveModesLocked()) mSaveRetryPending = 0;
+            else --mSaveRetryPending;
+        }
         if (mModeRetryPending > 0) {
             if (reconcileLocked()) {
                 mModeRetryPending = 0;
@@ -242,7 +238,7 @@ void HintController::runPerfTimer() {
             }
         }
         const bool ok = reconcilePerfLocked();
-        if (!ok || mModeRetryPending > 0) {
+        if (!ok || mModeRetryPending > 0 || mSaveRetryPending > 0) {
             // Cancellation and persistent-mode retries are bounded in rate,
             // while payload votes have their own libperfmgr timeout as a fail-safe.
             mPerfCv.wait_for(lock, Ms(100));

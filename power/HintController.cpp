@@ -116,27 +116,19 @@ bool HintController::boostsBlockedLocked() const {
            mRequested.contains("Flipendo") || wantedLocked("SUSTAINED_PERFORMANCE");
 }
 
-bool HintController::cancelTransientLocked() {
-    bool ok = clearPerfLocked();
-    // Cancel them on mode transitions, even if the timer already expired. Never
-    // replay a finite hint when a blocking mode is subsequently released.
-    // Only this controller starts them, so once all cancellations have been
-    // enqueued there is nothing left to cancel until one is started again:
-    // repeated blocking mode calls then add no jobs to the shared queue.
-    if (mTransientMayBeActive) {
-        bool ended = true;
-        for (const auto* name : kTransientHints) {
-            if (mBackend.supports(name)) ended = mBackend.end(name) && ended;
-        }
-        if (ended) mTransientMayBeActive = false;
-        ok = ended && ok;
-    }
-    mInteractionDeadline = {};
-    return ok;
-}
-
 bool HintController::reconcileLocked() {
+    // Retry failed backend writes, never the original screen transition: replaying
+    // clearPerfLocked() could drop a new fingerprint lease admitted since then.
     bool ok = true;
+    if (mPerfCancelPending) {
+        mPerfCancelPending = !reconcilePerfLocked();
+        ok = !mPerfCancelPending;
+    }
+    for (auto it = mPendingEnds.begin(); it != mPendingEnds.end();) {
+        if (mBackend.end(*it)) it = mPendingEnds.erase(it);
+        else { ++it; ok = false; }
+    }
+    if (!ok) return false;
     // End conflicting floors before applying saver caps. Only persistent mode
     // requests are restored later; timeout-based hints are not persistent modes.
     for (auto it = mApplied.begin(); it != mApplied.end();) {
@@ -183,7 +175,9 @@ bool HintController::setMode(const std::string& name, bool enabled) {
         // loading boost gets the same treatment here.
         if (name == "GAME_LOADING" && saverLocked()) return true;
         mTransientMayBeActive = true;
-        return mBackend.start(name);  // Per-node JSON timeouts; each call renews.
+        if (!mBackend.start(name)) return false;
+        mPendingEnds.erase(name);  // A fresh accepted vote supersedes an older failed end.
+        return true;
     }
 
     // Only a real screen-off -> screen-on transition: not the first report
@@ -203,6 +197,11 @@ bool HintController::setMode(const std::string& name, bool enabled) {
     // jobs. Even a failed enqueue must not erase a masked request on restart.
     // A property failure is reported, but must not prevent safety cancellations.
     const bool saved = saveModesLocked();
+    mSaveRetryPending = saved ? 0 : 8;
+    if (!saved) {
+        startTimerLocked();
+        mPerfCv.notify_all();
+    }
 
     // Enqueued before the screen-off fingerprint lease is cancelled below, so
     // the floors both of them request are not dropped in between.
@@ -210,23 +209,27 @@ bool HintController::setMode(const std::string& name, bool enabled) {
     // A saver that was just enabled ends a running game loading boost; one
     // enabled earlier already keeps it from starting.
     if (enabled && (name == "LOW_POWER" || name == "Flipendo") &&
-        mBackend.supports("GAME_LOADING") && !mBackend.end("GAME_LOADING")) {
-        noteModeFailureLocked(false);
-        return false;
-    }
+        mBackend.supports("GAME_LOADING")) mPendingEnds.insert("GAME_LOADING");
 
-    // Never promote/replay a screen-off lease on wake. Requested sustained
-    // cancels it even when LOW_POWER masks the effective sustained mode.
-    if (((name == "INTERACTIVE" && enabled) ||
-         mRequested.contains("SUSTAINED_PERFORMANCE")) &&
-        !cancelGoodixScreenOffLocked()) return false;
-    // Every blocking mode call, including duplicate screen-off, drops perf
-    // leases and cancels the finite hints unless that cancellation is already
-    // enqueued and nothing was started since. It does not refund the budget.
-    if (boostsBlockedLocked() && !cancelTransientLocked()) {
-        noteModeFailureLocked(false);
-        return false;
+    // Remove logical leases once. Reconciliation retries only the backend delta.
+    if (boostsBlockedLocked()) {
+        mPerfLocks.clear();
+        mPerfCancelPending = true;
+        if (mTransientMayBeActive) {
+            for (const auto* hint : kTransientHints) {
+                if (mBackend.supports(hint)) mPendingEnds.insert(hint);
+            }
+            mTransientMayBeActive = false;
+        }
+        mInteractionDeadline = {};
+    } else if ((name == "INTERACTIVE" && enabled) ||
+               mRequested.contains("SUSTAINED_PERFORMANCE")) {
+        std::erase_if(mPerfLocks, [](const auto& item) {
+            return item.second.profile == kGoodixScreenOffProfile;
+        });
+        mPerfCancelPending = true;
     }
+    if (mPerfCancelPending) mPerfCv.notify_all();
     const bool reconciled = reconcileLocked();
     noteModeFailureLocked(reconciled);
     return reconciled && saved;
@@ -255,6 +258,7 @@ bool HintController::setBoost(const std::string& name, int32_t durationMs) {
     }
     mTransientMayBeActive = true;
     if (!mBackend.startFor(name, duration)) return false;
+    mPendingEnds.erase(name);
     ++mInteractionEnqueued;
     mInteractionDeadline = deadline;
     return true;
@@ -283,6 +287,7 @@ bool HintController::setDisplayUpdateBoostLocked(int32_t durationMs) {
     mTransientMayBeActive = true;
     // The caller's duration (always 0 from SurfaceFlinger) is not used.
     if (!mBackend.startFor(kDisplayUpdateHint, kDisplayUpdateBoost)) return false;
+    mPendingEnds.erase(kDisplayUpdateHint);
     ++mDisplayUpdateEnqueued;
     return true;
 }
@@ -296,6 +301,7 @@ void HintController::startWakeBoostLocked() {
     mTransientMayBeActive = true;
     // Best effort: a failed enqueue must not fail the screen-on mode call.
     if (!mBackend.startFor("INTERACTION", duration)) return;
+    mPendingEnds.erase("INTERACTION");
     ++mWakeBoosts;
     mInteractionDeadline = deadline;
 }
@@ -320,6 +326,7 @@ std::string HintController::dump() const {
         << mDisplayUpdateEnqueued << '/' << mDisplayUpdateQuietSkipped << '/'
         << mDisplayUpdateSkipped
         << "\nRequested-mode save failures: " << mModeSaveFailures
+        << " (pending retries: " << mSaveRetryPending << ")"
         << "\nMode reconcile failures/pending retries: " << mModeReconcileFailures
         << '/' << mModeRetryPending
         << "\nBoosts blocked: " << boostsBlockedLocked()

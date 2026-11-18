@@ -81,7 +81,6 @@ class HintController {
     bool reconcileLocked();
     void noteModeFailureLocked(bool reconciled);
     void startTimerLocked();
-    bool cancelTransientLocked();
     bool boostsBlockedLocked() const;
     bool saverLocked() const;
     bool setDisplayUpdateBoostLocked(int32_t durationMs);
@@ -91,7 +90,6 @@ class HintController {
     void expirePerfLocked();
     void runPerfTimer();
     bool clearPerfLocked();
-    bool cancelGoodixScreenOffLocked();
     int acquirePerfLocked(uint64_t owner, int handle, int durationMs,
                           const std::string& profile, bool allowScreenOff = false);
 
@@ -102,6 +100,9 @@ class HintController {
     uint64_t mModeSaveFailures = 0;
     uint64_t mModeReconcileFailures = 0;
     unsigned mModeRetryPending = 0;
+    unsigned mSaveRetryPending = 0;
+    std::set<std::string> mPendingEnds;
+    bool mPerfCancelPending = false;
     mutable std::mutex mMutex;
     std::set<std::string> mRequested;
     std::set<std::string> mApplied;

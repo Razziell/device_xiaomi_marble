@@ -244,18 +244,73 @@ TEST(TransientCancel, RepeatedBlockingModeCallsDoNotRequeueCancellations) {
     EXPECT_FALSE(backend.active.contains("LAUNCH"));
 }
 
-TEST(TransientCancel, FailedCancellationIsRetriedByTheNextBlockingCall) {
+// dump() takes the controller mutex. Poll only its snapshot, never a fake
+// backend container while the retry worker may be writing it.
+bool waitForRetryCompletion(HintController& controller) {
+    const auto until = Clock::now() + 2s;
+    do {
+        if (controller.dump().find("Mode reconcile failures/pending retries: 1/0\n") !=
+            std::string::npos) return true;
+        std::this_thread::sleep_for(5ms);
+    } while (Clock::now() < until);
+    return false;
+}
+
+TEST(TransientCancel, SaverRecoversWithoutSecondBlockingCall) {
     Backend backend;
-    HintController controller(backend);
-    ASSERT_TRUE(controller.setMode("INTERACTIVE", true));
-    ASSERT_TRUE(controller.setBoost("INTERACTION", 300));
-    backend.rejectEnd = true;
-    EXPECT_FALSE(controller.setMode("INTERACTIVE", false));
-    backend.rejectEnd = false;
-    // The retry thread reconciles persistent modes only; the transient vote
-    // is cancelled by this call because the failed attempt stayed recorded.
-    ASSERT_TRUE(controller.setMode("INTERACTIVE", false));
+    {
+        HintController controller(backend);
+        ASSERT_TRUE(controller.setMode("INTERACTIVE", true));
+        ASSERT_TRUE(controller.setMode("GAME_LOADING", true));
+        ASSERT_TRUE(controller.setBoost("INTERACTION", 300));
+        backend.rejectEnd = true;
+        EXPECT_FALSE(controller.setMode("Flipendo", true));
+        backend.rejectEnd = false;
+        ASSERT_TRUE(waitForRetryCompletion(controller));
+    }
+    EXPECT_FALSE(backend.active.contains("GAME_LOADING"));
     EXPECT_FALSE(backend.active.contains("INTERACTION"));
+    EXPECT_TRUE(backend.active.contains("Flipendo"));
+}
+
+TEST(WakeBoost, FailedFingerprintCancellationDoesNotLoseGameRestore) {
+    Backend backend;
+    {
+        HintController controller(backend);
+        const auto owner = controller.openPerfOwner();
+        ASSERT_TRUE(controller.setMode("INTERACTIVE", true));
+        ASSERT_TRUE(controller.setMode("GAME", true));
+        ASSERT_TRUE(controller.setMode("INTERACTIVE", false));
+        ASSERT_GT(controller.acquireGoodix(owner, 0, 500, GoodixAccess{true, true, true}), 0);
+        backend.rejectEnd = true;
+        EXPECT_FALSE(controller.setMode("INTERACTIVE", true));
+        backend.rejectEnd = false;
+        ASSERT_TRUE(waitForRetryCompletion(controller));
+    }
+    EXPECT_TRUE(backend.active.contains("GAME"));
+    EXPECT_FALSE(backend.active.contains(kGoodixScreenOffProfile));
+}
+
+TEST(ModePersistence, FailedSaveIsRetriedWithoutAnotherModeCall) {
+    struct Store : RequestedModeStore {
+        std::atomic<unsigned> attempts{0};
+        std::string saved;
+        std::string load() const override { return {}; }
+        bool save(const std::string& value) override {
+            if (++attempts == 1) return false;
+            saved = value;
+            return true;
+        }
+    } store;
+    Backend backend;
+    {
+        HintController controller(backend, {}, &store);
+        EXPECT_FALSE(controller.setMode("INTERACTIVE", true));
+        const auto until = Clock::now() + 2s;
+        while (store.attempts < 2 && Clock::now() < until) std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_EQ(store.saved, encodeRequestedModes({"INTERACTIVE"}, true));
+    EXPECT_EQ(backend.starts["INTERACTIVE"], 1u);
 }
 
 TEST(TransientCancel, FirstBlockingCallAfterStartupAlwaysCancels) {
